@@ -1,0 +1,20 @@
+# @package _global_
+
+##################################################################################
+# Isaac Lab G1 aligned with humanoid_rl_gym MuJoCo deployment
+##################################################################################
+
+num_eval_episodes: 0
+num_record_episodes: 0
+
+env:
+  env_type: 'isaaclab'
+  env_name: 'FlashSAC-Isaac-G1-HRLG-Flat-v0'
+  num_env_steps: ${num_env_steps}
+
+  seed: ${seed}
+  num_train_envs: ${num_train_envs}
+  num_eval_envs: null
+  num_record_envs: null
+  rescale_action: null
+  max_episode_steps: null

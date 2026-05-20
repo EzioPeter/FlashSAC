@@ -14,6 +14,7 @@ ACTION_BOUNDS = {
     "Isaac-Repose-Cube-Allegro-Direct-v0": 1.0,
     "Isaac-Velocity-Flat-G1-v0": 1.0,
     "Isaac-Velocity-Rough-G1-v0": 1.0,
+    "FlashSAC-Isaac-G1-HRLG-Flat-v0": 1.0,
     "Isaac-Velocity-Flat-H1-v0": 1.0,
     "Isaac-Velocity-Rough-H1-v0": 1.0,
     "Isaac-Lift-Cube-Franka-v0": 3.0,
@@ -71,6 +72,8 @@ class IsaacLabVectorEnv(
         self.simulation_app = app_launcher.app
 
         from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+        import flash_rl.envs.isaaclab_tasks.g1_hrlg  # noqa: F401
 
         env_cfg = parse_env_cfg(
             env_name,

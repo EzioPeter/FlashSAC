@@ -13,6 +13,9 @@ def evaluate(
     num_episodes: int,
     env_type: str,
 ) -> dict[str, float]:
+    if num_episodes == 0:
+        return {}
+
     num_envs = env.num_envs
 
     assert num_episodes % num_envs == 0, "num_episodes must be divisible by env.num_envs"

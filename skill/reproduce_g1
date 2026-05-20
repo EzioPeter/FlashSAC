@@ -1,0 +1,121 @@
+**实施计划**
+1. 在 FlashSAC 新增一个自定义 IsaacLab G1 任务，不能直接用现有 `Isaac-Velocity-Flat-G1-v0`，因为它是 `123 obs -> 37 action`。
+2. 自定义任务必须对齐 `humanoid_rl_gym/deploy/deploy_mujoco/configs/g1.yaml`：`98 obs -> 29 action`。
+3. action joint order、default angles、`action_scale=0.25` 完全按 `g1.yaml`。
+4. obs 顺序按 `deploy_g1.py`：`ang_vel, gravity, cmd, dof_pos, dof_vel, last_action, gait_sin, gait_cos`。
+5. 在 IsaacLab task config 中显式限制 action/obs joint_names，只使用 29 个 humanoid_rl_gym joints。
+6. 在 FlashSAC 增加 env config，例如 `configs/env/isaaclab_g1_hrlg.yaml`。
+7. 增加 actor export 脚本，把 FlashSAC checkpoint 导出成 `torch.jit`，让 `deploy_g1.py` 能直接 `torch.jit.load()`。
+8. 验证顺序：shape/joint-order 单测 -> IsaacLab 小步训练 smoke test -> export -> MuJoCo sim2sim 短时 rollout。
+
+**Skill 草案**
+```markdown
+---
+name: flashsac-isaaclab-g1-sim2sim
+description: Use when implementing or modifying FlashSAC IsaacLab training code for a 29-DoF Unitree G1 policy that must export to the humanoid_rl_gym MuJoCo sim2sim interface. Covers obs/action alignment, IsaacLab task registration, FlashSAC config wiring, checkpoint export, and validation.
+---
+
+# FlashSAC IsaacLab G1 Sim2Sim
+
+## Goal
+
+Implement a FlashSAC training path that trains in IsaacLab but exports a policy usable by:
+`/home/xjy/writing/CORL_2026/code/humanoid_rl_gym/deploy/deploy_mujoco/deploy_g1.py`.
+
+Do not use the existing FlashSAC `Isaac-Velocity-Flat-G1-v0` task directly; it is `123 obs -> 37 action`.
+The target interface is humanoid_rl_gym G1: `98 obs -> 29 action`.
+
+## Required Interface
+
+Use the joint order from:
+`/home/xjy/writing/CORL_2026/code/humanoid_rl_gym/deploy/deploy_mujoco/configs/g1.yaml`
+
+Target obs layout:
+
+```text
+base_ang_vel        3
+projected_gravity   3
+commands            3
+joint_pos_rel       29
+joint_vel_rel       29
+last_action         29
+gait_sin_cos         2
+total               98
+```
+
+Target action layout:
+
+```text
+action              29
+target_q = default_q + 0.25 * action
+```
+
+## Implementation Steps
+
+1. Inspect `g1.yaml` and `deploy_g1.py` before editing.
+2. Add a custom IsaacLab task/config inside FlashSAC, preferably under `flash_rl/envs/isaaclab_tasks/`.
+3. Register a new Gymnasium id, e.g. `FlashSAC-Isaac-G1-HRLG-Flat-v0`.
+4. Use a 29-DoF G1 asset/config and explicitly set `joint_names` for action and observation terms.
+5. Remove base linear velocity from policy obs.
+6. Add gait phase sin/cos observation to match humanoid_rl_gym.
+7. Set action scale to `0.25` with default joint offset.
+8. Add `configs/env/isaaclab_g1_hrlg.yaml`.
+9. Ensure `flash_rl/envs/isaaclab.py` imports/registers the custom task before `gym.make`.
+10. Add an export script that loads FlashSAC `actor.pt` and exports deterministic `tanh(mean)` as TorchScript.
+
+## Validation
+
+Run these checks before long training:
+
+```bash
+uv run python -c "instantiate env and assert obs_dim==98 and action_dim==29"
+uv run python train.py --overrides env=isaaclab_g1_hrlg --overrides num_env_steps=2048 --overrides num_train_envs=16
+uv run python scripts/export_flashsac_actor.py --checkpoint_path ... --output_path ...
+```
+
+Then test in humanoid_rl_gym MuJoCo with a short rollout by pointing `g1.yaml.policy_path` to the exported `policy.pt`.
+
+## Guardrails
+
+Do not silently reorder joints.
+Do not change humanoid_rl_gym obs format unless also updating MuJoCo deploy.
+Do not export stochastic SAC actions; deployment must use deterministic `torch.tanh(mean)`.
+Do not use the current 37-DoF IsaacLab checkpoint for this 29-DoF path.
+```
+
+**执行 Prompt**
+```text
+你在两个代码库中工作：
+
+FlashSAC:
+`/home/xjy/writing/CORL_2026/code/FlashSAC`
+
+humanoid_rl_gym:
+`/home/xjy/writing/CORL_2026/code/humanoid_rl_gym`
+
+目标：在 FlashSAC 框架里实现一个 IsaacLab 训练版本的 29-DoF Unitree G1 task，使训练出的 FlashSAC actor 可以导出为 TorchScript，并直接用于 humanoid_rl_gym 的 MuJoCo sim2sim `deploy/deploy_mujoco/deploy_g1.py`。
+
+关键约束：
+
+1. 不要使用现有 FlashSAC 的 `Isaac-Velocity-Flat-G1-v0` 作为最终接口，因为它是 `123 obs -> 37 action`。
+2. 目标接口必须对齐 humanoid_rl_gym 的 `deploy/deploy_mujoco/configs/g1.yaml` 和 `deploy/deploy_mujoco/deploy_g1.py`。
+3. policy obs 必须是 98 维：
+   `ang_vel(3), gravity(3), command(3), dof_pos(29), dof_vel(29), last_action(29), gait_sin_cos(2)`。
+4. action 必须是 29 维，joint order 完全等于 `g1.yaml` 的 `model_joint_names`。
+5. IsaacLab 训练中的 target joint position 必须等价于：
+   `target_q = default_q + 0.25 * action`。
+6. 添加新的 IsaacLab task/config，而不是污染原有 IsaacLab G1 task。
+7. 添加 FlashSAC env config，例如 `configs/env/isaaclab_g1_hrlg.yaml`。
+8. 添加导出脚本，将 FlashSAC checkpoint 的 actor 导出为 `torch.jit` policy：
+   输入 `[B, 98]`，输出 deterministic `torch.tanh(mean)` 的 `[B, 29]`。
+9. 完成后做 smoke test：
+   - env 可以实例化
+   - obs/action shape 正确
+   - joint order 打印并与 g1.yaml 对齐
+   - `uv run python train.py` 可以小步跑通
+   - 导出的 `policy.pt` 能被 `torch.jit.load()` 加载
+
+请先实现最小可运行版本，保留清晰注释和验证命令，不要启动长时间训练。
+```
+
+这个 skill/prompt 的核心是：**IsaacLab 负责高并发训练，导出的接口伪装成 humanoid_rl_gym 的 MuJoCo policy**。这样路线最干净，也最容易做真实 sim2sim 对比。

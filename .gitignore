@@ -159,6 +159,7 @@ tmp/**
 # cache
 *.ipynb_checkpoints
 *.nfs*
+.vscode/
 
 # saved checkpoints
 models/**
