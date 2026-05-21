@@ -155,10 +155,13 @@ cython_debug/
 # log
 wandb/**
 tmp/**
+runs/
+videos/
 
 # cache
 *.ipynb_checkpoints
 *.nfs*
+.vscode/
 
 # saved checkpoints
 models/**

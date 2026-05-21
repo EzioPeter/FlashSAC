@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-CUDA_VISIBLE_DEVICES=2 uv run python train.py \
+CUDA_VISIBLE_DEVICES=0 uv run python train.py \
   --config_path ./configs \
   --config_name flashSAC_base \
   --overrides env=mujoco_playground_g1_hrlg \
@@ -18,6 +18,7 @@ CUDA_VISIBLE_DEVICES=2 uv run python train.py \
   --overrides num_record_episodes=0 \
   --overrides updates_per_interaction_step=2 \
   --overrides agent.buffer_max_length=10000000 \
+  --overrides agent.buffer_device_type=cpu \
   --overrides agent.buffer_min_length=100000 \
   --overrides agent.sample_batch_size=2048 \
   --overrides agent.use_amp=true \
