@@ -20,8 +20,13 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)  # type: igno
 MUJOCO_PLAYGROUND_HUMANOID_ENVS = [
     "G1JoystickRoughTerrain",
     "G1JoystickFlatTerrain",
+    "G1JoystickFlatTerrainHRLG",
     "T1JoystickRoughTerrain",
     "T1JoystickFlatTerrain",
+]
+
+LOCAL_MUJOCO_PLAYGROUND_ENVS = [
+    "G1JoystickFlatTerrainHRLG",
 ]
 
 
@@ -212,7 +217,16 @@ def make_mujoco_playground_env(
     width: int = 320,
     **kwargs: Any,
 ) -> MujocoPlaygroundEnv:
-    cfg = registry.get_default_config(env_name)
+    is_local_env = env_name in LOCAL_MUJOCO_PLAYGROUND_ENVS
+    if is_local_env:
+        from flash_rl.envs.mujoco_playground_tasks.g1_hrlg import (
+            G1JoystickFlatTerrainHRLG,
+            default_config as g1_hrlg_default_config,
+        )
+
+        cfg = g1_hrlg_default_config()
+    else:
+        cfg = registry.get_default_config(env_name)
     is_humanoid_task = env_name in MUJOCO_PLAYGROUND_HUMANOID_ENVS
 
     # Randomizations
@@ -223,7 +237,10 @@ def make_mujoco_playground_env(
         cfg.push_config.magnitude_range = [0.0, 0.0]
 
     # Raw env
-    env = registry.load(env_name, config=cfg)
+    if is_local_env:
+        env = G1JoystickFlatTerrainHRLG(config=cfg)
+    else:
+        env = registry.load(env_name, config=cfg)
 
     # Wrappers (order following `wrap_for_brax_training`: https://tinyurl.com/3az279ww)
     env = VmapWrapper(env)
