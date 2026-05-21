@@ -37,7 +37,7 @@ from mujoco_playground._src.collision import geoms_colliding
 
 DEFAULT_CHECKPOINT = (
     REPO_ROOT
-    / "models/mjp_g1_hrlg/flat_50m_gpu2/G1JoystickFlatTerrainHRLG/seed0-0521-115545/step48829"
+    / "models/mjp_g1_hrlg/flat_50m_gpu2/G1JoystickFlatTerrainHRLG/seed0-0521-154319/step48829"
 )
 
 

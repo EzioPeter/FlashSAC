@@ -10,6 +10,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python train.py \
   --overrides env=mujoco_playground_g1_hrlg \
   --overrides agent=flashSAC \
   --overrides agent.asymmetric_observation=true \
+  --overrides env.use_domain_randomization=true \
   --overrides num_train_envs=1024 \
   --overrides num_eval_envs=50 \
   --overrides num_record_envs=0 \

@@ -1,3 +1,4 @@
+import functools
 from typing import Any, Union
 
 import gymnasium as gym
@@ -9,7 +10,7 @@ from gymnasium.vector import VectorEnv
 from gymnasium.vector.utils import batch_space
 from mujoco_playground import registry
 from mujoco_playground._src.mjx_env import MjxEnv, State
-from mujoco_playground._src.wrapper import Wrapper
+from mujoco_playground._src.wrapper import BraxDomainRandomizationVmapWrapper, Wrapper
 
 from flash_rl.types import NDArray
 
@@ -222,17 +223,26 @@ def make_mujoco_playground_env(
         from flash_rl.envs.mujoco_playground_tasks.g1_hrlg import (
             G1JoystickFlatTerrainHRLG,
             default_config as g1_hrlg_default_config,
+            event_cfg_domain_randomize,
         )
 
         cfg = g1_hrlg_default_config()
+        domain_randomizer = event_cfg_domain_randomize
     else:
         cfg = registry.get_default_config(env_name)
+        domain_randomizer = registry.get_domain_randomizer(env_name)
     is_humanoid_task = env_name in MUJOCO_PLAYGROUND_HUMANOID_ENVS
 
     # Randomizations
+    randomization_fn = None
     if use_domain_randomization:
-        raise NotImplementedError
-    if is_humanoid_task and not use_push_randomization:
+        if domain_randomizer is None:
+            raise NotImplementedError(f"No domain randomizer is registered for {env_name}.")
+        randomization_rng = jax.random.split(jax.random.PRNGKey(seed), num_envs)
+        randomization_fn = functools.partial(domain_randomizer, rng=randomization_rng)
+        if is_local_env:
+            cfg.event_domain_randomization = True
+    if is_humanoid_task and not use_push_randomization and not use_domain_randomization:
         cfg.push_config.enable = False
         cfg.push_config.magnitude_range = [0.0, 0.0]
 
@@ -243,7 +253,10 @@ def make_mujoco_playground_env(
         env = registry.load(env_name, config=cfg)
 
     # Wrappers (order following `wrap_for_brax_training`: https://tinyurl.com/3az279ww)
-    env = VmapWrapper(env)
+    if randomization_fn is None:
+        env = VmapWrapper(env)
+    else:
+        env = BraxDomainRandomizationVmapWrapper(env, randomization_fn)
     if max_episode_steps is not None:
         env = EpisodeWrapper(env, max_episode_steps, action_repeat=1)
     env = AutoResetWrapper(env)
