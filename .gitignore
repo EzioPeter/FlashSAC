@@ -162,6 +162,7 @@ videos/
 *.ipynb_checkpoints
 *.nfs*
 .vscode/
+outputs/
 
 # saved checkpoints
 models/**
