@@ -157,6 +157,7 @@ wandb/**
 tmp/**
 runs/
 videos/
+logs/
 
 # cache
 *.ipynb_checkpoints

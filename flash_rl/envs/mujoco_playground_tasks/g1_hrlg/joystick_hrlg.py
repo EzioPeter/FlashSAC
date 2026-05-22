@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Optional, Union
 
 import jax
 import jax.numpy as jp
+import numpy as np
 from mujoco import mjx
 from mujoco.mjx._src import math
+from mujoco_playground._src import mjx_env
 from mujoco_playground._src.collision import geoms_colliding
 from mujoco_playground._src.locomotion.g1 import joystick as g1_joystick
-from mujoco_playground._src import mjx_env
 from mujoco_playground._src.mjx_env import State
 
 from . import constants as hrlg
@@ -32,7 +33,7 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
     def __init__(
         self,
         config=None,
-        config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
+        config_overrides: Optional[dict[str, Union[str, int, list[Any]]]] = None,
     ):
         super().__init__(
             task="flat_terrain",
@@ -47,10 +48,29 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
         self._init_q = self._init_q.at[7:].set(self._default_pose)
         self._base_mjx_qpos0 = jp.array(self.mjx_model.qpos0)
         self._cmd_scale = jp.array(hrlg.CMD_SCALE, dtype=jp.float32)
+        self._apply_real_world_pd_gains()
         self._validate_hrlg_joint_order()
 
     def _joint_default_pose(self) -> jax.Array:
         return self._default_pose + (self.mjx_model.qpos0[7:] - self._base_mjx_qpos0[7:])
+
+    def _apply_real_world_pd_gains(self) -> None:
+        stiffness = np.asarray(hrlg.REAL_WORLD_STIFFNESS, dtype=np.float64)
+        damping = np.asarray(hrlg.REAL_WORLD_DAMPING, dtype=np.float64)
+        if stiffness.shape != (hrlg.ACTION_SIZE,) or damping.shape != (hrlg.ACTION_SIZE,):
+            raise ValueError(
+                f"Expected {hrlg.ACTION_SIZE} PD gains, got "
+                f"stiffness={stiffness.shape}, damping={damping.shape}."
+            )
+
+        for index, joint_name in enumerate(hrlg.JOINT_NAMES):
+            joint = self._mj_model.joint(joint_name)
+            dof_id = int(joint.dofadr[0])
+            self._mj_model.actuator_gainprm[index, 0] = stiffness[index]
+            self._mj_model.actuator_biasprm[index, 1] = -stiffness[index]
+            self._mj_model.dof_damping[dof_id] = damping[index]
+
+        self._mjx_model = mjx.put_model(self._mj_model)
 
     def _validate_hrlg_joint_order(self) -> None:
         if self.mjx_model.nu != hrlg.ACTION_SIZE:
