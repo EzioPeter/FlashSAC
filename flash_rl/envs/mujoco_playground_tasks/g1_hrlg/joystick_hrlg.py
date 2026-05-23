@@ -48,27 +48,29 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
         self._init_q = self._init_q.at[7:].set(self._default_pose)
         self._base_mjx_qpos0 = jp.array(self.mjx_model.qpos0)
         self._cmd_scale = jp.array(hrlg.CMD_SCALE, dtype=jp.float32)
-        self._apply_real_world_pd_gains()
+        self._apply_waist_pd_gains()
         self._validate_hrlg_joint_order()
 
     def _joint_default_pose(self) -> jax.Array:
         return self._default_pose + (self.mjx_model.qpos0[7:] - self._base_mjx_qpos0[7:])
 
-    def _apply_real_world_pd_gains(self) -> None:
-        stiffness = np.asarray(hrlg.REAL_WORLD_STIFFNESS, dtype=np.float64)
-        damping = np.asarray(hrlg.REAL_WORLD_DAMPING, dtype=np.float64)
-        if stiffness.shape != (hrlg.ACTION_SIZE,) or damping.shape != (hrlg.ACTION_SIZE,):
+    def _apply_waist_pd_gains(self) -> None:
+        stiffness = np.asarray(hrlg.WAIST_STIFFNESS, dtype=np.float64)
+        damping = np.asarray(hrlg.WAIST_DAMPING, dtype=np.float64)
+        waist_joint_names = hrlg.WAIST_JOINT_NAMES
+        if stiffness.shape != (len(waist_joint_names),) or damping.shape != (len(waist_joint_names),):
             raise ValueError(
-                f"Expected {hrlg.ACTION_SIZE} PD gains, got "
+                f"Expected {len(waist_joint_names)} waist PD gains, got "
                 f"stiffness={stiffness.shape}, damping={damping.shape}."
             )
 
-        for index, joint_name in enumerate(hrlg.JOINT_NAMES):
+        for joint_name, kp, kd in zip(waist_joint_names, stiffness, damping):
             joint = self._mj_model.joint(joint_name)
+            actuator_id = hrlg.JOINT_NAMES.index(joint_name)
             dof_id = int(joint.dofadr[0])
-            self._mj_model.actuator_gainprm[index, 0] = stiffness[index]
-            self._mj_model.actuator_biasprm[index, 1] = -stiffness[index]
-            self._mj_model.dof_damping[dof_id] = damping[index]
+            self._mj_model.actuator_gainprm[actuator_id, 0] = kp
+            self._mj_model.actuator_biasprm[actuator_id, 1] = -kp
+            self._mj_model.dof_damping[dof_id] = kd
 
         self._mjx_model = mjx.put_model(self._mj_model)
 
