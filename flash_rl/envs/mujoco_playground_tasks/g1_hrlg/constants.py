@@ -78,6 +78,51 @@ DEFAULT_ANGLES = (
     0.0,
 )
 
+LEG_JOINT_NAMES = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+)
+
+LEG_STIFFNESS = (
+    40.1792,
+    99.0984,
+    40.1792,
+    99.0984,
+    28.5012,
+    28.5012,
+    40.1792,
+    99.0984,
+    40.1792,
+    99.0984,
+    28.5012,
+    28.5012,
+)
+
+LEG_DAMPING = (
+    2.5579,
+    6.3088,
+    2.5579,
+    6.3088,
+    1.8144,
+    1.8144,
+    2.5579,
+    6.3088,
+    2.5579,
+    6.3088,
+    1.8144,
+    1.8144,
+)
+
 WAIST_JOINT_NAMES = (
     "waist_yaw_joint",
     "waist_roll_joint",

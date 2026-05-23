@@ -55,9 +55,15 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
         return self._default_pose + (self.mjx_model.qpos0[7:] - self._base_mjx_qpos0[7:])
 
     def _apply_real_world_pd_gains(self) -> None:
-        joint_names = hrlg.WAIST_JOINT_NAMES + hrlg.ARM_JOINT_NAMES
-        stiffness = np.asarray(hrlg.WAIST_STIFFNESS + hrlg.ARM_STIFFNESS, dtype=np.float64)
-        damping = np.asarray(hrlg.WAIST_DAMPING + hrlg.ARM_DAMPING, dtype=np.float64)
+        joint_names = hrlg.LEG_JOINT_NAMES + hrlg.WAIST_JOINT_NAMES + hrlg.ARM_JOINT_NAMES
+        stiffness = np.asarray(
+            hrlg.LEG_STIFFNESS + hrlg.WAIST_STIFFNESS + hrlg.ARM_STIFFNESS,
+            dtype=np.float64,
+        )
+        damping = np.asarray(
+            hrlg.LEG_DAMPING + hrlg.WAIST_DAMPING + hrlg.ARM_DAMPING,
+            dtype=np.float64,
+        )
         if stiffness.shape != (len(joint_names),) or damping.shape != (len(joint_names),):
             raise ValueError(
                 f"Expected {len(joint_names)} real-world PD gains, got "
@@ -141,13 +147,35 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
         )
         event_push_interval_steps = jp.round(event_push_interval / self.dt).astype(jp.int32)
 
+        if self._config.event_domain_randomization:
+            rng, zero_offset_rng, action_delay_rng = jax.random.split(rng, 3)
+            motor_zero_offset = jax.random.uniform(
+                zero_offset_rng,
+                shape=(self.mjx_model.nu,),
+                minval=hrlg_randomize.MOTOR_ZERO_OFFSET_RANGE[0],
+                maxval=hrlg_randomize.MOTOR_ZERO_OFFSET_RANGE[1],
+            )
+            action_delay_steps = jax.random.randint(
+                action_delay_rng,
+                shape=(),
+                minval=hrlg_randomize.ACTION_DELAY_STEP_RANGE[0],
+                maxval=hrlg_randomize.ACTION_DELAY_STEP_RANGE[1] + 1,
+                dtype=jp.int32,
+            )
+        else:
+            motor_zero_offset = jp.zeros(self.mjx_model.nu)
+            action_delay_steps = jp.array(0, dtype=jp.int32)
+
         info = {
             "rng": rng,
             "step": 0,
             "command": cmd,
             "last_act": jp.zeros(self.mjx_model.nu),
             "last_last_act": jp.zeros(self.mjx_model.nu),
+            "applied_action": jp.zeros(self.mjx_model.nu),
             "motor_targets": jp.zeros(self.mjx_model.nu),
+            "motor_zero_offset": motor_zero_offset,
+            "action_delay_steps": action_delay_steps,
             "feet_air_time": jp.zeros(2),
             "last_contact": jp.zeros(2, dtype=bool),
             "swing_peak": jp.zeros(2),
@@ -217,8 +245,12 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
             push = jp.hstack([push_xy * push_magnitude, jp.zeros(4)])
 
         joint_default_pose = state.info.get("joint_default_pose", self._default_pose)
-        motor_targets = joint_default_pose + action * self._config.action_scale
+        action_delay_steps = state.info.get("action_delay_steps", jp.array(0, dtype=jp.int32))
+        applied_action = jp.where(action_delay_steps > 0, state.info["last_act"], action)
+        motor_zero_offset = state.info.get("motor_zero_offset", jp.zeros(self.mjx_model.nu))
+        motor_targets = joint_default_pose + motor_zero_offset + applied_action * self._config.action_scale
         data = mjx_env.step(self.mjx_model, state.data, motor_targets, self.n_substeps)
+        state.info["applied_action"] = applied_action
         state.info["motor_targets"] = motor_targets
 
         contact = jp.array([geoms_colliding(data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id])
