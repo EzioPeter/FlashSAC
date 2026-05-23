@@ -95,3 +95,54 @@ WAIST_DAMPING = (
     1.8144,
     1.8144,
 )
+
+ARM_JOINT_NAMES = (
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
+
+ARM_STIFFNESS = (
+    50.0,
+    50.0,
+    50.0,
+    14.2506,
+    14.2506,
+    16.7783,
+    16.7783,
+    50.0,
+    50.0,
+    50.0,
+    14.2506,
+    14.2506,
+    16.7783,
+    16.7783,
+)
+
+ARM_DAMPING = (
+    0.9072,
+    0.9072,
+    0.9072,
+    0.9072,
+    0.9072,
+    1.0681,
+    1.0681,
+    0.9072,
+    0.9072,
+    0.9072,
+    0.9072,
+    0.9072,
+    1.0681,
+    1.0681,
+)

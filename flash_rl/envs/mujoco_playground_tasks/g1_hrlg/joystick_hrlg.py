@@ -48,23 +48,23 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
         self._init_q = self._init_q.at[7:].set(self._default_pose)
         self._base_mjx_qpos0 = jp.array(self.mjx_model.qpos0)
         self._cmd_scale = jp.array(hrlg.CMD_SCALE, dtype=jp.float32)
-        self._apply_waist_pd_gains()
+        self._apply_real_world_pd_gains()
         self._validate_hrlg_joint_order()
 
     def _joint_default_pose(self) -> jax.Array:
         return self._default_pose + (self.mjx_model.qpos0[7:] - self._base_mjx_qpos0[7:])
 
-    def _apply_waist_pd_gains(self) -> None:
-        stiffness = np.asarray(hrlg.WAIST_STIFFNESS, dtype=np.float64)
-        damping = np.asarray(hrlg.WAIST_DAMPING, dtype=np.float64)
-        waist_joint_names = hrlg.WAIST_JOINT_NAMES
-        if stiffness.shape != (len(waist_joint_names),) or damping.shape != (len(waist_joint_names),):
+    def _apply_real_world_pd_gains(self) -> None:
+        joint_names = hrlg.WAIST_JOINT_NAMES + hrlg.ARM_JOINT_NAMES
+        stiffness = np.asarray(hrlg.WAIST_STIFFNESS + hrlg.ARM_STIFFNESS, dtype=np.float64)
+        damping = np.asarray(hrlg.WAIST_DAMPING + hrlg.ARM_DAMPING, dtype=np.float64)
+        if stiffness.shape != (len(joint_names),) or damping.shape != (len(joint_names),):
             raise ValueError(
-                f"Expected {len(waist_joint_names)} waist PD gains, got "
+                f"Expected {len(joint_names)} real-world PD gains, got "
                 f"stiffness={stiffness.shape}, damping={damping.shape}."
             )
 
-        for joint_name, kp, kd in zip(waist_joint_names, stiffness, damping):
+        for joint_name, kp, kd in zip(joint_names, stiffness, damping):
             joint = self._mj_model.joint(joint_name)
             actuator_id = hrlg.JOINT_NAMES.index(joint_name)
             dof_id = int(joint.dofadr[0])
@@ -167,10 +167,7 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
             metrics[f"reward/{key}"] = jp.zeros(())
         metrics["swing_peak"] = jp.zeros(())
 
-        contact = jp.array([
-            geoms_colliding(data, geom_id, self._floor_geom_id)
-            for geom_id in self._feet_geom_id
-        ])
+        contact = jp.array([geoms_colliding(data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id])
         obs = self._get_obs(data, info, contact)
         reward, done = jp.zeros(2)
         state = mjx_env.State(data, obs, reward, done, metrics, info)
@@ -224,10 +221,7 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
         data = mjx_env.step(self.mjx_model, state.data, motor_targets, self.n_substeps)
         state.info["motor_targets"] = motor_targets
 
-        contact = jp.array([
-            geoms_colliding(data, geom_id, self._floor_geom_id)
-            for geom_id in self._feet_geom_id
-        ])
+        contact = jp.array([geoms_colliding(data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id])
         contact_filt = contact | state.info["last_contact"]
         first_contact = (state.info["feet_air_time"] > 0.0) * contact_filt
         state.info["feet_air_time"] += self.dt
@@ -237,13 +231,8 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
 
         done = self._get_termination(data)
 
-        rewards = self._get_reward(
-            data, action, state.info, state.metrics, done, first_contact, contact
-        )
-        rewards = {
-            key: value * self._config.reward_config.scales[key]
-            for key, value in rewards.items()
-        }
+        rewards = self._get_reward(data, action, state.info, state.metrics, done, first_contact, contact)
+        rewards = {key: value * self._config.reward_config.scales[key] for key, value in rewards.items()}
         reward = sum(rewards.values()) * self.dt
 
         state.info["push"] = push
@@ -275,10 +264,9 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
         state = state.replace(data=data, reward=reward, done=done)
         state.info["policy_step"] = jp.where(state.done, 0, previous_policy_step + 1)
 
-        contact = jp.array([
-            geoms_colliding(state.data, geom_id, self._floor_geom_id)
-            for geom_id in self._feet_geom_id
-        ])
+        contact = jp.array(
+            [geoms_colliding(state.data, geom_id, self._floor_geom_id) for geom_id in self._feet_geom_id]
+        )
         obs = self._get_obs(state.data, state.info, contact)
         return state.replace(obs=obs)
 
@@ -325,15 +313,17 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
         gait_phase = policy_step * self.dt / hrlg.GAIT_PHASE_CYCLE
         gait_angle = 2.0 * jp.pi * gait_phase
 
-        state = jp.hstack([
-            noisy_gyro * hrlg.ANG_VEL_SCALE,
-            noisy_gravity,
-            info["command"] * self._cmd_scale,
-            (noisy_joint_angles - joint_default_pose) * hrlg.DOF_POS_SCALE,
-            noisy_joint_vel * hrlg.DOF_VEL_SCALE,
-            info["last_act"],
-            jp.array([jp.sin(gait_angle), jp.cos(gait_angle)]),
-        ])
+        state = jp.hstack(
+            [
+                noisy_gyro * hrlg.ANG_VEL_SCALE,
+                noisy_gravity,
+                info["command"] * self._cmd_scale,
+                (noisy_joint_angles - joint_default_pose) * hrlg.DOF_POS_SCALE,
+                noisy_joint_vel * hrlg.DOF_VEL_SCALE,
+                info["last_act"],
+                jp.array([jp.sin(gait_angle), jp.cos(gait_angle)]),
+            ]
+        )
 
         accelerometer = self.get_accelerometer(data, "pelvis")
         linvel = self.get_local_linvel(data, "pelvis")
@@ -341,21 +331,23 @@ class G1JoystickFlatTerrainHRLG(g1_joystick.Joystick):
         feet_vel = data.sensordata[self._foot_linvel_sensor_adr].ravel()
         root_height = data.qpos[2]
 
-        privileged_state = jp.hstack([
-            state,
-            gyro,
-            accelerometer,
-            gravity,
-            linvel,
-            global_angvel,
-            joint_angles - joint_default_pose,
-            joint_vel,
-            root_height,
-            data.actuator_force,
-            contact,
-            feet_vel,
-            info["feet_air_time"],
-        ])
+        privileged_state = jp.hstack(
+            [
+                state,
+                gyro,
+                accelerometer,
+                gravity,
+                linvel,
+                global_angvel,
+                joint_angles - joint_default_pose,
+                joint_vel,
+                root_height,
+                data.actuator_force,
+                contact,
+                feet_vel,
+                info["feet_air_time"],
+            ]
+        )
 
         return {
             "state": state,
