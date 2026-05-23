@@ -75,7 +75,8 @@ class Network:
 
     @torch.no_grad()
     def normalize_parameters(self) -> None:
-        assert self._weight_normalize_fn is not None
+        if self._weight_normalize_fn is None:
+            return
         self._weight_normalize_fn()
 
     @torch.no_grad()

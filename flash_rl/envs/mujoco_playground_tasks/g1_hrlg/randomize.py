@@ -7,12 +7,20 @@ import jax.numpy as jp
 from mujoco import mjx
 
 NUM_MATERIAL_BUCKETS = 64
+BASE_BODY_ID = 1
 TORSO_BODY_ID = 16
 
 STATIC_FRICTION_RANGE = (0.3, 1.6)
 DYNAMIC_FRICTION_RANGE = (0.3, 1.2)
 RESTITUTION_RANGE = (0.0, 0.5)
 JOINT_DEFAULT_POS_RANGE = (-0.01, 0.01)
+BASE_MASS_ADDED_RANGE = (-1.0, 1.0)
+LINK_MASS_MULTIPLIER_RANGE = (0.9, 1.1)
+PD_STIFFNESS_MULTIPLIER_RANGE = (0.9, 1.1)
+PD_DAMPING_MULTIPLIER_RANGE = (0.9, 1.1)
+MOTOR_STRENGTH_RANGE = (0.8, 1.2)
+MOTOR_ZERO_OFFSET_RANGE = (-0.035, 0.035)
+ACTION_DELAY_STEP_RANGE = (0, 1)
 TORSO_COM_RANGE = (
     (-0.025, 0.025),
     (-0.05, 0.05),
@@ -49,12 +57,8 @@ def event_cfg_domain_randomize(model: mjx.Model, rng: jax.Array) -> tuple[mjx.Mo
 
         robot_geom_mask = model.geom_bodyid > 0
         geom_friction = model.geom_friction
-        geom_friction = geom_friction.at[:, 0].set(
-            jp.where(robot_geom_mask, static_friction, geom_friction[:, 0])
-        )
-        geom_friction = geom_friction.at[:, 1].set(
-            jp.where(robot_geom_mask, dynamic_friction, geom_friction[:, 1])
-        )
+        geom_friction = geom_friction.at[:, 0].set(jp.where(robot_geom_mask, static_friction, geom_friction[:, 0]))
+        geom_friction = geom_friction.at[:, 1].set(jp.where(robot_geom_mask, dynamic_friction, geom_friction[:, 1]))
 
         one_rng, key = jax.random.split(one_rng)
         pair_static = _bucket_uniform(key, (model.npair,), STATIC_FRICTION_RANGE)
@@ -82,21 +86,104 @@ def event_cfg_domain_randomize(model: mjx.Model, rng: jax.Array) -> tuple[mjx.Mo
         )
         body_ipos = model.body_ipos.at[TORSO_BODY_ID].set(model.body_ipos[TORSO_BODY_ID] + torso_com_offset)
 
-        return geom_friction, pair_friction, qpos0, body_ipos
+        one_rng, key = jax.random.split(one_rng)
+        base_mass_delta = jax.random.uniform(
+            key,
+            (),
+            minval=BASE_MASS_ADDED_RANGE[0],
+            maxval=BASE_MASS_ADDED_RANGE[1],
+        )
+        body_mass = model.body_mass.at[BASE_BODY_ID].set(
+            jp.maximum(1e-3, model.body_mass[BASE_BODY_ID] + base_mass_delta)
+        )
 
-    geom_friction, pair_friction, qpos0, body_ipos = rand_dynamics(rng)
+        one_rng, key = jax.random.split(one_rng)
+        link_mass_multiplier = jax.random.uniform(
+            key,
+            shape=(model.nbody,),
+            minval=LINK_MASS_MULTIPLIER_RANGE[0],
+            maxval=LINK_MASS_MULTIPLIER_RANGE[1],
+        )
+        link_mass_multiplier = jp.where(jp.arange(model.nbody) > BASE_BODY_ID, link_mass_multiplier, 1.0)
+        body_mass = body_mass * link_mass_multiplier
+
+        one_rng, key = jax.random.split(one_rng)
+        kp_multiplier = jax.random.uniform(
+            key,
+            shape=(model.nu,),
+            minval=PD_STIFFNESS_MULTIPLIER_RANGE[0],
+            maxval=PD_STIFFNESS_MULTIPLIER_RANGE[1],
+        )
+        one_rng, key = jax.random.split(one_rng)
+        kd_multiplier = jax.random.uniform(
+            key,
+            shape=(model.nu,),
+            minval=PD_DAMPING_MULTIPLIER_RANGE[0],
+            maxval=PD_DAMPING_MULTIPLIER_RANGE[1],
+        )
+        one_rng, key = jax.random.split(one_rng)
+        motor_strength = jax.random.uniform(
+            key,
+            shape=(model.nu,),
+            minval=MOTOR_STRENGTH_RANGE[0],
+            maxval=MOTOR_STRENGTH_RANGE[1],
+        )
+
+        actuator_gainprm = model.actuator_gainprm.at[:, 0].set(
+            model.actuator_gainprm[:, 0] * kp_multiplier * motor_strength
+        )
+        actuator_biasprm = model.actuator_biasprm.at[:, 1].set(
+            model.actuator_biasprm[:, 1] * kp_multiplier * motor_strength
+        )
+        dof_damping = model.dof_damping.at[6 : 6 + model.nu].set(
+            model.dof_damping[6 : 6 + model.nu] * kd_multiplier * motor_strength
+        )
+
+        return (
+            geom_friction,
+            pair_friction,
+            qpos0,
+            body_ipos,
+            body_mass,
+            actuator_gainprm,
+            actuator_biasprm,
+            dof_damping,
+        )
+
+    (
+        geom_friction,
+        pair_friction,
+        qpos0,
+        body_ipos,
+        body_mass,
+        actuator_gainprm,
+        actuator_biasprm,
+        dof_damping,
+    ) = rand_dynamics(rng)
 
     in_axes = jax.tree_util.tree_map(lambda _: None, model)
-    in_axes = in_axes.tree_replace({
-        "geom_friction": 0,
-        "pair_friction": 0,
-        "qpos0": 0,
-        "body_ipos": 0,
-    })
-    model = model.tree_replace({
-        "geom_friction": geom_friction,
-        "pair_friction": pair_friction,
-        "qpos0": qpos0,
-        "body_ipos": body_ipos,
-    })
+    in_axes = in_axes.tree_replace(
+        {
+            "geom_friction": 0,
+            "pair_friction": 0,
+            "qpos0": 0,
+            "body_ipos": 0,
+            "body_mass": 0,
+            "actuator_gainprm": 0,
+            "actuator_biasprm": 0,
+            "dof_damping": 0,
+        }
+    )
+    model = model.tree_replace(
+        {
+            "geom_friction": geom_friction,
+            "pair_friction": pair_friction,
+            "qpos0": qpos0,
+            "body_ipos": body_ipos,
+            "body_mass": body_mass,
+            "actuator_gainprm": actuator_gainprm,
+            "actuator_biasprm": actuator_biasprm,
+            "dof_damping": dof_damping,
+        }
+    )
     return model, in_axes

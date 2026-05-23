@@ -4,18 +4,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MAX_JOBS="${MAX_JOBS:-2}"
-DATASET="outputs/mjp_g1_hrlg_seed0_0521_154319_step48829_buffer_100x1000_observable_reward.npz"
+DATASET="outputs/mjp_g1_hrlg_seed0_0522_232057_step97658_buffer_100x1000_observable_reward.npz"
 
 BASE_OUT="models/mjp_g1_hrlg_bc_mopo"
 
-BC_10="models/mjp_g1_hrlg_bc/seed0_10traj_200ep_eval10/epoch_0190"
-BC_25="models/mjp_g1_hrlg_bc/seed0_25traj_200ep_eval10/epoch_0200"
-BC_50="models/mjp_g1_hrlg_bc/seed0_50traj_200ep_eval10/epoch_0120"
+BC_10="models/mjp_g1_hrlg_bc/seed0_0522_232057_step97658_10traj_200ep_noeval/final"
+BC_25="models/mjp_g1_hrlg_bc/seed0_0522_232057_step97658_25traj_200ep_noeval/final"
+BC_50="models/mjp_g1_hrlg_bc/seed0_0522_232057_step97658_50traj_200ep_noeval/final"
 
 COMMON_ARGS=(
   --dataset "$DATASET"
   --reward-source observable
   --seed 0
+  --device cuda:0
   --batch-size 1024
   --model-batch-size 1024
   --dynamics-ensemble-size 5
@@ -39,12 +40,13 @@ COMMON_ARGS=(
   --online-eval-episodes 50
   --online-eval-num-envs 50
   --online-eval-max-episode-steps 1000
+  --online-eval-device cuda:0
   --save-interval 10
 )
 
 QUEUE_LOG_DIR="$BASE_OUT/queue_logs"
 mkdir -p "$QUEUE_LOG_DIR"
-QUEUE_LOG="$QUEUE_LOG_DIR/queue_$(date +%Y%m%d_%H%M%S).log"
+QUEUE_LOG="$QUEUE_LOG_DIR/queue_step97658_$(date +%Y%m%d_%H%M%S).log"
 
 SEM="$(mktemp -u)"
 mkfifo "$SEM"
@@ -89,9 +91,9 @@ run_group() {
   local ntraj="$1"
   local bc_checkpoint="$2"
 
-  local wm_dir="$BASE_OUT/world_model_seed0_${ntraj}traj_observable_fixed"
-  local bc_mopo_dir="$BASE_OUT/seed0_${ntraj}traj_bc_mopo_fixed_200ep_eval10"
-  local pure_mopo_dir="$BASE_OUT/seed0_${ntraj}traj_pure_mopo_fixed_200ep_eval10"
+  local wm_dir="$BASE_OUT/world_model_seed0_0522_232057_step97658_${ntraj}traj_observable"
+  local bc_mopo_dir="$BASE_OUT/seed0_0522_232057_step97658_${ntraj}traj_bc_mopo_200ep_eval10"
+  local pure_mopo_dir="$BASE_OUT/seed0_0522_232057_step97658_${ntraj}traj_pure_mopo_200ep_eval10"
   local wm_checkpoint="$wm_dir/best_model"
 
   if ! run_limited "world_model_${ntraj}traj" "$wm_dir" \

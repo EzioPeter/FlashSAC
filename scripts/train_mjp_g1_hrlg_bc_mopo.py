@@ -42,7 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from flash_rl.agents.flashSAC.network import FlashSACActor, FlashSACDoubleCritic, FlashSACTemperature
-from flash_rl.agents.flashSAC.update import update_actor, update_critic, update_target_network, update_temperature
+from flash_rl.agents.flashSAC.update import update_critic, update_target_network, update_temperature
 from flash_rl.agents.utils.network import Network
 from flash_rl.envs.mujoco_playground_tasks.g1_hrlg import constants as hrlg
 
@@ -88,6 +88,8 @@ class TransitionArrays:
     step: np.ndarray
     qpos_root: np.ndarray | None = None
     qvel_root: np.ndarray | None = None
+    next_qpos_root: np.ndarray | None = None
+    next_qvel_root: np.ndarray | None = None
 
     def select(self, indices: np.ndarray) -> "TransitionArrays":
         return TransitionArrays(
@@ -101,6 +103,8 @@ class TransitionArrays:
             step=self.step[indices],
             qpos_root=None if self.qpos_root is None else self.qpos_root[indices],
             qvel_root=None if self.qvel_root is None else self.qvel_root[indices],
+            next_qpos_root=None if self.next_qpos_root is None else self.next_qpos_root[indices],
+            next_qvel_root=None if self.next_qvel_root is None else self.next_qvel_root[indices],
         )
 
     @property
@@ -133,28 +137,53 @@ class DynamicsEnsemble(nn.Module):
         action_dim: int,
         hidden_dim: int,
         layers: int,
+        predict_root: bool,
         predict_reward: bool,
         predict_done: bool,
     ):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
+        self.root_dim = 13 if predict_root else 0
+        self.predict_root = predict_root
         self.predict_reward = predict_reward
         self.predict_done = predict_done
+        root_output_dim = self.root_dim
         extra_dim = int(predict_reward) + int(predict_done)
-        output_dim = obs_dim + extra_dim
+        output_dim = obs_dim + root_output_dim + extra_dim
         self.members = nn.ModuleList(
-            DynamicsMember(obs_dim + action_dim, output_dim, hidden_dim, layers)
+            DynamicsMember(obs_dim + action_dim + self.root_dim, output_dim, hidden_dim, layers)
             for _ in range(ensemble_size)
         )
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([obs, action], dim=-1)
+    def forward(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        qpos_root: torch.Tensor | None = None,
+        qvel_root: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        parts = [obs, action]
+        if self.predict_root:
+            if qpos_root is None or qvel_root is None:
+                raise ValueError("Root-aware dynamics requires qpos_root and qvel_root inputs.")
+            parts.extend([qpos_root, qvel_root])
+        x = torch.cat(parts, dim=-1)
         return torch.stack([member(x) for member in self.members], dim=0)
 
-    def split_prediction(self, pred: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    def split_prediction(
+        self,
+        pred: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         delta = pred[..., : self.obs_dim]
         offset = self.obs_dim
+        delta_qpos_root = None
+        delta_qvel_root = None
+        if self.predict_root:
+            delta_qpos_root = pred[..., offset : offset + 7]
+            offset += 7
+            delta_qvel_root = pred[..., offset : offset + 6]
+            offset += 6
         reward = None
         done_logit = None
         if self.predict_reward:
@@ -162,7 +191,7 @@ class DynamicsEnsemble(nn.Module):
             offset += 1
         if self.predict_done:
             done_logit = pred[..., offset]
-        return delta, reward, done_logit
+        return delta, delta_qpos_root, delta_qvel_root, reward, done_logit
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -218,6 +247,219 @@ def _fit_obs_stats(observations: np.ndarray, eps: float = 1e-6) -> tuple[np.ndar
     mean = observations.mean(axis=0, dtype=np.float64).astype(np.float32)
     std = observations.std(axis=0, dtype=np.float64).astype(np.float32)
     return mean, np.maximum(std, eps).astype(np.float32)
+
+
+def _fit_root_stats(
+    qpos_root: np.ndarray | None,
+    qvel_root: np.ndarray | None,
+    eps: float = 1e-6,
+) -> dict[str, np.ndarray]:
+    if qpos_root is None or qvel_root is None:
+        return {
+            "qpos_root_mean": np.zeros(7, dtype=np.float32),
+            "qpos_root_std": np.ones(7, dtype=np.float32),
+            "qvel_root_mean": np.zeros(6, dtype=np.float32),
+            "qvel_root_std": np.ones(6, dtype=np.float32),
+            "enabled": np.asarray(False),
+        }
+    return {
+        "qpos_root_mean": qpos_root.mean(axis=0, dtype=np.float64).astype(np.float32),
+        "qpos_root_std": np.maximum(qpos_root.std(axis=0, dtype=np.float64), eps).astype(np.float32),
+        "qvel_root_mean": qvel_root.mean(axis=0, dtype=np.float64).astype(np.float32),
+        "qvel_root_std": np.maximum(qvel_root.std(axis=0, dtype=np.float64), eps).astype(np.float32),
+        "enabled": np.asarray(True),
+    }
+
+
+def _load_root_stats_from_dynamics_checkpoint(checkpoint: Path) -> dict[str, np.ndarray]:
+    stats_path = checkpoint / "root_stats.npz"
+    if not stats_path.exists():
+        return _fit_root_stats(None, None)
+    with np.load(stats_path) as stats:
+        return {
+            "qpos_root_mean": stats["qpos_root_mean"].astype(np.float32),
+            "qpos_root_std": np.maximum(stats["qpos_root_std"].astype(np.float32), 1e-6),
+            "qvel_root_mean": stats["qvel_root_mean"].astype(np.float32),
+            "qvel_root_std": np.maximum(stats["qvel_root_std"].astype(np.float32), 1e-6),
+            "enabled": np.asarray(bool(np.asarray(stats["enabled"]).item())),
+        }
+
+
+def _quat_conj_torch(quat: torch.Tensor) -> torch.Tensor:
+    out = quat.clone()
+    out[..., 1:] = -out[..., 1:]
+    return out
+
+
+def _quat_mul_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    aw, ax, ay, az = torch.unbind(a, dim=-1)
+    bw, bx, by, bz = torch.unbind(b, dim=-1)
+    return torch.stack(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ],
+        dim=-1,
+    )
+
+
+def _rotate_world_to_body_torch(quat_wxyz: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    zeros = torch.zeros(vec.shape[:-1] + (1,), dtype=vec.dtype, device=vec.device)
+    vec_quat = torch.cat([zeros, vec], dim=-1)
+    return _quat_mul_torch(_quat_mul_torch(_quat_conj_torch(quat_wxyz), vec_quat), quat_wxyz)[..., 1:]
+
+
+def _normalize_root_quat(qpos_root: torch.Tensor) -> torch.Tensor:
+    qpos_root = qpos_root.clone()
+    quat = qpos_root[..., 3:7]
+    qpos_root[..., 3:7] = quat / quat.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    return qpos_root
+
+
+def _make_observable_reward_context(device: torch.device) -> dict[str, Any]:
+    from scripts.relabel_mjp_g1_hrlg_observable_reward import (
+        ObservableRewardConfig,
+        _make_env_metadata,
+    )
+
+    reward_scales, env_info = _make_env_metadata()
+    config = ObservableRewardConfig(
+        dt=float(env_info["dt"]),
+        tracking_sigma=float(env_info["tracking_sigma"]),
+        bad_orientation_limit_rad=1.0,
+        base_height_done_threshold=0.0,
+        use_projected_gravity_orientation=True,
+        linear_velocity_frame="root_world_velocity_rotated_to_base_frame",
+        angular_velocity_source="unscaled_policy_gyro",
+    )
+    selected_terms = (
+        "tracking_lin_vel",
+        "tracking_ang_vel",
+        "orientation",
+        "ang_vel_xy",
+        "joint_deviation_hip",
+        "joint_deviation_knee",
+        "pose",
+        "dof_pos_limits",
+        "stand_still",
+        "action_rate",
+        "base_height",
+        "dof_acc",
+        "termination",
+    )
+    return {
+        "dt": float(config.dt),
+        "tracking_sigma": float(config.tracking_sigma),
+        "bad_orientation_limit_rad": float(config.bad_orientation_limit_rad),
+        "base_height_done_threshold": float(config.base_height_done_threshold),
+        "base_height_target": float(env_info["base_height_target"]),
+        "default_pose": torch.as_tensor(
+            np.array(env_info["default_pose"], copy=True), dtype=torch.float32, device=device
+        ),
+        "hip_indices": torch.as_tensor(np.array(env_info["hip_indices"], copy=True), dtype=torch.long, device=device),
+        "knee_indices": torch.as_tensor(np.array(env_info["knee_indices"], copy=True), dtype=torch.long, device=device),
+        "soft_lowers": torch.as_tensor(
+            np.array(env_info["soft_lowers"], copy=True), dtype=torch.float32, device=device
+        ),
+        "soft_uppers": torch.as_tensor(
+            np.array(env_info["soft_uppers"], copy=True), dtype=torch.float32, device=device
+        ),
+        "reward_scales": {name: float(reward_scales.get(name, 0.0)) for name in selected_terms},
+        "selected_terms": selected_terms,
+        "metadata": {
+            "reward_scales": {name: float(reward_scales.get(name, 0.0)) for name in selected_terms},
+            "selected_terms": list(selected_terms),
+            "formula_reward": "torch_observable_reward_from_predicted_next_obs_root",
+            "base_height_done_threshold": float(config.base_height_done_threshold),
+            "bad_orientation_limit_rad": float(config.bad_orientation_limit_rad),
+        },
+    }
+
+
+def _compute_observable_reward_torch(
+    *,
+    obs_t_norm: torch.Tensor,
+    act_t: torch.Tensor,
+    obs_tp1_norm: torch.Tensor,
+    qpos_root_tp1: torch.Tensor,
+    qvel_root_tp1: torch.Tensor,
+    obs_mean: torch.Tensor,
+    obs_std: torch.Tensor,
+    context: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    obs_t = obs_t_norm * obs_std + obs_mean
+    obs_tp1 = obs_tp1_norm * obs_std + obs_mean
+    cmd_scale = torch.as_tensor(hrlg.CMD_SCALE, dtype=obs_t.dtype, device=obs_t.device)
+    command = obs_t[..., SLICES["command"]] / cmd_scale
+    gyro = obs_tp1[..., SLICES["gyro"]] / float(hrlg.ANG_VEL_SCALE)
+    projected_gravity = obs_tp1[..., SLICES["projected_gravity"]]
+    joint_pos_rel = obs_tp1[..., SLICES["joint_pos"]] / float(hrlg.DOF_POS_SCALE)
+    joint_vel = obs_tp1[..., SLICES["joint_vel"]] / float(hrlg.DOF_VEL_SCALE)
+    prev_joint_vel = obs_t[..., SLICES["joint_vel"]] / float(hrlg.DOF_VEL_SCALE)
+    last_act = obs_t[..., SLICES["last_act"]]
+
+    qpos_root_tp1 = _normalize_root_quat(qpos_root_tp1)
+    quat = qpos_root_tp1[..., 3:7]
+    root_lin_world = qvel_root_tp1[..., 0:3]
+    base_lin_vel = _rotate_world_to_body_torch(quat, root_lin_world)
+    base_height = qpos_root_tp1[..., 2]
+
+    default_pose = context["default_pose"].to(dtype=obs_t.dtype, device=obs_t.device)
+    hip_indices = context["hip_indices"].to(device=obs_t.device)
+    knee_indices = context["knee_indices"].to(device=obs_t.device)
+    soft_lowers = context["soft_lowers"].to(dtype=obs_t.dtype, device=obs_t.device)
+    soft_uppers = context["soft_uppers"].to(dtype=obs_t.dtype, device=obs_t.device)
+    joint_pos = joint_pos_rel + default_pose
+
+    lin_vel_error = torch.sum(torch.square(command[..., :2] - base_lin_vel[..., :2]), dim=-1)
+    ang_vel_error = torch.square(command[..., 2] - gyro[..., 2])
+    hip_error = joint_pos[..., hip_indices] - default_pose[hip_indices]
+    hip_weight_default = torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=obs_t.dtype, device=obs_t.device)
+    hip_weight_lateral = torch.tensor([0.0, 1.0, 0.0, 1.0], dtype=obs_t.dtype, device=obs_t.device)
+    hip_weight = torch.where(command[..., 1:2] > 0.1, hip_weight_lateral, hip_weight_default)
+    out_of_limits = -torch.clamp(joint_pos - soft_lowers, max=0.0)
+    out_of_limits = out_of_limits + torch.clamp(joint_pos - soft_uppers, min=0.0)
+    gravity_z = torch.clamp(-projected_gravity[..., 2], -1.0, 1.0)
+    tilt = torch.abs(torch.acos(gravity_z))
+    bad_orientation = tilt > float(context["bad_orientation_limit_rad"])
+    if float(context["base_height_done_threshold"]) <= 0:
+        bad_height = torch.zeros_like(bad_orientation)
+    else:
+        bad_height = base_height < float(context["base_height_done_threshold"])
+    finite = (
+        torch.isfinite(obs_t).all(dim=-1)
+        & torch.isfinite(obs_tp1).all(dim=-1)
+        & torch.isfinite(qpos_root_tp1).all(dim=-1)
+        & torch.isfinite(qvel_root_tp1).all(dim=-1)
+        & torch.isfinite(act_t).all(dim=-1)
+    )
+    done = (bad_orientation | bad_height | (~finite)).to(dtype=obs_t.dtype)
+
+    components = {
+        "tracking_lin_vel": torch.exp(-lin_vel_error / float(context["tracking_sigma"])),
+        "tracking_ang_vel": torch.exp(-ang_vel_error / float(context["tracking_sigma"])),
+        "orientation": torch.sum(torch.square(projected_gravity[..., :2]), dim=-1),
+        "ang_vel_xy": torch.sum(torch.square(gyro[..., :2]), dim=-1),
+        "joint_deviation_hip": torch.sum(torch.abs(hip_error) * hip_weight, dim=-1),
+        "joint_deviation_knee": torch.sum(
+            torch.abs(joint_pos[..., knee_indices] - default_pose[knee_indices]),
+            dim=-1,
+        ),
+        "pose": torch.sum(torch.square(joint_pos - default_pose), dim=-1),
+        "dof_pos_limits": torch.sum(out_of_limits, dim=-1),
+        "stand_still": torch.sum(torch.abs(joint_pos - default_pose), dim=-1)
+        * (torch.linalg.norm(command, dim=-1) < 0.01).to(dtype=obs_t.dtype),
+        "action_rate": torch.sum(torch.square(act_t - last_act), dim=-1),
+        "base_height": torch.square(base_height - float(context["base_height_target"])),
+        "dof_acc": torch.sum(torch.square((joint_vel - prev_joint_vel) / float(context["dt"])), dim=-1),
+        "termination": done,
+    }
+    reward = torch.zeros_like(done)
+    for name, value in components.items():
+        reward = reward + float(context["reward_scales"].get(name, 0.0)) * value * float(context["dt"])
+    return reward, done, components
 
 
 def _load_obs_stats_from_checkpoint(checkpoint: Path) -> tuple[np.ndarray, np.ndarray, bool] | None:
@@ -284,15 +526,17 @@ def _load_dynamics_checkpoint(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Missing dynamics checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if bool(ckpt.get("predict_root", dynamics.predict_root)) != bool(dynamics.predict_root):
+        raise ValueError(
+            f"Dynamics root-head mismatch: checkpoint={ckpt.get('predict_root')} current={dynamics.predict_root}"
+        )
     if bool(ckpt.get("predict_reward", dynamics.predict_reward)) != bool(dynamics.predict_reward):
         raise ValueError(
-            f"Dynamics reward-head mismatch: checkpoint={ckpt.get('predict_reward')} "
-            f"current={dynamics.predict_reward}"
+            f"Dynamics reward-head mismatch: checkpoint={ckpt.get('predict_reward')} current={dynamics.predict_reward}"
         )
     if bool(ckpt.get("predict_done", dynamics.predict_done)) != bool(dynamics.predict_done):
         raise ValueError(
-            f"Dynamics done-head mismatch: checkpoint={ckpt.get('predict_done')} "
-            f"current={dynamics.predict_done}"
+            f"Dynamics done-head mismatch: checkpoint={ckpt.get('predict_done')} current={dynamics.predict_done}"
         )
     dynamics.load_state_dict(ckpt["network_state_dict"])
     return ckpt
@@ -428,15 +672,15 @@ def _load_transitions(
         traj_ids = np.broadcast_to(traj[:, None].astype(np.int32), (len(traj), states.shape[1] - 1))
         qpos = None if qpos_root is None else qpos_root[traj, :-1].reshape(-1, qpos_root.shape[-1]).copy()
         qvel = None if qvel_root is None else qvel_root[traj, :-1].reshape(-1, qvel_root.shape[-1]).copy()
+        next_qpos = None if qpos_root is None else qpos_root[traj, 1:].reshape(-1, qpos_root.shape[-1]).copy()
+        next_qvel = None if qvel_root is None else qvel_root[traj, 1:].reshape(-1, qvel_root.shape[-1]).copy()
         reward = (
             np.zeros(obs.shape[0], dtype=np.float32)
             if dataset_reward is None
             else dataset_reward[traj].reshape(-1).copy()
         )
         terminated = (
-            np.zeros(obs.shape[0], dtype=np.float32)
-            if dataset_done is None
-            else dataset_done[traj].reshape(-1).copy()
+            np.zeros(obs.shape[0], dtype=np.float32) if dataset_done is None else dataset_done[traj].reshape(-1).copy()
         )
         return TransitionArrays(
             observation=obs,
@@ -449,6 +693,8 @@ def _load_transitions(
             step=steps.reshape(-1).copy(),
             qpos_root=qpos,
             qvel_root=qvel,
+            next_qpos_root=next_qpos,
+            next_qvel_root=next_qvel,
         )
 
     train = build(train_traj)
@@ -662,6 +908,8 @@ def _normalize(arrays: TransitionArrays, obs_mean: np.ndarray, obs_std: np.ndarr
         step=arrays.step,
         qpos_root=arrays.qpos_root,
         qvel_root=arrays.qvel_root,
+        next_qpos_root=arrays.next_qpos_root,
+        next_qvel_root=arrays.next_qvel_root,
     )
 
 
@@ -673,12 +921,14 @@ def _batch_from_arrays(
     arrays: TransitionArrays,
     indices: torch.Tensor,
     device: torch.device,
+    *,
+    reward_scale: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     idx = indices.detach().cpu().numpy()
     obs = torch.as_tensor(arrays.observation[idx], dtype=torch.float32, device=device)
     next_obs = torch.as_tensor(arrays.next_observation[idx], dtype=torch.float32, device=device)
     action = torch.as_tensor(arrays.action[idx], dtype=torch.float32, device=device)
-    reward = torch.as_tensor(arrays.reward[idx], dtype=torch.float32, device=device)
+    reward = torch.as_tensor(arrays.reward[idx], dtype=torch.float32, device=device) * float(reward_scale)
     terminated = torch.as_tensor(arrays.terminated[idx], dtype=torch.float32, device=device)
     truncated = torch.as_tensor(arrays.truncated[idx], dtype=torch.float32, device=device)
     return {
@@ -698,8 +948,19 @@ def _concat_batches(batches: list[dict[str, torch.Tensor]]) -> dict[str, torch.T
     return {key: torch.cat([batch[key] for batch in batches], dim=0) for key in keys}
 
 
-def _make_real_batch(arrays: TransitionArrays, batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
-    return _batch_from_arrays(arrays, _sample_indices(arrays.size, batch_size, device), device)
+def _make_real_batch(
+    arrays: TransitionArrays,
+    batch_size: int,
+    device: torch.device,
+    *,
+    reward_scale: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    return _batch_from_arrays(
+        arrays,
+        _sample_indices(arrays.size, batch_size, device),
+        device,
+        reward_scale=reward_scale,
+    )
 
 
 def _force_last_action_slice(
@@ -724,12 +985,18 @@ def _generate_model_rollouts(
     actor: Network,
     dynamics: DynamicsEnsemble,
     start_obs: torch.Tensor,
+    start_qpos_root: torch.Tensor | None,
+    start_qvel_root: torch.Tensor | None,
     rollout_horizon: int,
     mopo_penalty_coef: float,
     obs_mean: torch.Tensor,
     obs_std: torch.Tensor,
     force_last_action: bool,
     done_threshold: float,
+    reward_scale: float,
+    formula_reward: bool,
+    formula_done: bool,
+    observable_reward_context: dict[str, Any] | None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     device = start_obs.device
     observations = []
@@ -741,17 +1008,26 @@ def _generate_model_rollouts(
     uncertainties = []
     raw_rewards = []
     obs = start_obs
+    qpos_root = None if start_qpos_root is None else start_qpos_root
+    qvel_root = None if start_qvel_root is None else start_qvel_root
     active = torch.ones(obs.shape[0], dtype=torch.bool, device=device)
     ensemble_size = len(dynamics.members)
+    root_uncertainties = []
+    if dynamics.predict_root and (qpos_root is None or qvel_root is None):
+        raise ValueError("Root-aware rollout requires start_qpos_root and start_qvel_root.")
+    if (formula_reward or formula_done) and (not dynamics.predict_root or observable_reward_context is None):
+        raise ValueError("Formula reward/done rollout requires root-aware dynamics and reward context.")
 
     for horizon_step in range(rollout_horizon):
         if not bool(torch.any(active)):
             break
         obs_active = obs[active]
+        qpos_active = None if qpos_root is None else qpos_root[active]
+        qvel_active = None if qvel_root is None else qvel_root[active]
         mean, _ = actor.apply("get_mean_and_std", observations=obs_active, training=False)
         action = torch.tanh(mean)
-        pred = dynamics(obs_active, action)
-        delta, reward_pred, done_logit = dynamics.split_prediction(pred)
+        pred = dynamics(obs_active, action, qpos_active, qvel_active)
+        delta, delta_qpos_root, delta_qvel_root, reward_pred, done_logit = dynamics.split_prediction(pred)
         next_per_model = obs_active.unsqueeze(0) + delta
         next_per_model = torch.stack(
             [
@@ -766,26 +1042,62 @@ def _generate_model_rollouts(
             ],
             dim=0,
         )
-        variance_mean = next_per_model.var(dim=0).mean(dim=-1)
-        uncertainty = variance_mean
+        obs_uncertainty = next_per_model.var(dim=0).mean(dim=-1)
+        root_uncertainty = torch.zeros_like(obs_uncertainty)
+        next_qpos_per_model = None
+        next_qvel_per_model = None
+        if dynamics.predict_root:
+            assert qpos_active is not None and qvel_active is not None
+            assert delta_qpos_root is not None and delta_qvel_root is not None
+            next_qpos_per_model = _normalize_root_quat(qpos_active.unsqueeze(0) + delta_qpos_root)
+            next_qvel_per_model = qvel_active.unsqueeze(0) + delta_qvel_root
+            root_uncertainty = next_qpos_per_model.var(dim=0).mean(dim=-1)
+            root_uncertainty = root_uncertainty + next_qvel_per_model.var(dim=0).mean(dim=-1)
+        uncertainty = obs_uncertainty + root_uncertainty
 
-        if reward_pred is None:
-            reward_mean = -mopo_penalty_coef * uncertainty
+        member_idx = torch.randint(0, ensemble_size, (obs_active.shape[0],), device=device)
+        row_idx = torch.arange(obs_active.shape[0], device=device)
+        next_sample = next_per_model[member_idx, row_idx]
+        next_qpos_sample = None
+        next_qvel_sample = None
+        if next_qpos_per_model is not None and next_qvel_per_model is not None:
+            next_qpos_sample = next_qpos_per_model[member_idx, row_idx]
+            next_qvel_sample = next_qvel_per_model[member_idx, row_idx]
+
+        formula_reward_unscaled = None
+        formula_done_tensor = None
+        if formula_reward or formula_done:
+            assert next_qpos_sample is not None and next_qvel_sample is not None
+            assert observable_reward_context is not None
+            formula_reward_unscaled, formula_done_tensor, _ = _compute_observable_reward_torch(
+                obs_t_norm=obs_active,
+                act_t=action,
+                obs_tp1_norm=next_sample,
+                qpos_root_tp1=next_qpos_sample,
+                qvel_root_tp1=next_qvel_sample,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+                context=observable_reward_context,
+            )
+
+        if formula_reward and formula_reward_unscaled is not None:
+            reward_mean = formula_reward_unscaled
+        elif reward_pred is None:
+            reward_mean = torch.zeros_like(uncertainty)
         else:
             reward_mean = reward_pred.mean(dim=0)
-        penalized_reward = reward_mean - mopo_penalty_coef * uncertainty
+        penalized_reward_unscaled = reward_mean - mopo_penalty_coef * uncertainty
+        penalized_reward = penalized_reward_unscaled * float(reward_scale)
 
-        if done_logit is None:
+        if formula_done and formula_done_tensor is not None:
+            done = formula_done_tensor
+        elif done_logit is None:
             done = torch.zeros_like(penalized_reward)
         else:
             done = (torch.sigmoid(done_logit.mean(dim=0)) > done_threshold).float()
         truncated = torch.zeros_like(done)
         if horizon_step == rollout_horizon - 1:
             truncated = 1.0 - done
-
-        member_idx = torch.randint(0, ensemble_size, (obs_active.shape[0],), device=device)
-        row_idx = torch.arange(obs_active.shape[0], device=device)
-        next_sample = next_per_model[member_idx, row_idx]
 
         observations.append(obs_active)
         actions.append(action)
@@ -794,12 +1106,21 @@ def _generate_model_rollouts(
         terminateds.append(done)
         truncateds.append(truncated)
         uncertainties.append(uncertainty)
+        root_uncertainties.append(root_uncertainty)
         raw_rewards.append(reward_mean)
 
         obs_next = obs.clone()
         active_indices = active.nonzero(as_tuple=False).squeeze(-1)
         obs_next[active_indices] = next_sample
         obs = obs_next
+        if qpos_root is not None and next_qpos_sample is not None:
+            qpos_next = qpos_root.clone()
+            qpos_next[active_indices] = next_qpos_sample
+            qpos_root = qpos_next
+        if qvel_root is not None and next_qvel_sample is not None:
+            qvel_next = qvel_root.clone()
+            qvel_next[active_indices] = next_qvel_sample
+            qvel_root = qvel_next
         still_active = done <= 0.5
         active_next = active.clone()
         active_next[active_indices] = still_active
@@ -819,14 +1140,21 @@ def _generate_model_rollouts(
         "actor_next_observation": torch.cat(next_observations, dim=0),
     }
     uncertainty_tensor = torch.cat(uncertainties, dim=0)
+    root_uncertainty_tensor = (
+        torch.cat(root_uncertainties, dim=0) if root_uncertainties else torch.zeros_like(uncertainty_tensor)
+    )
     raw_reward_tensor = torch.cat(raw_rewards, dim=0)
     metrics = {
         "synthetic_transition_count": float(synthetic["observation"].shape[0]),
         "uncertainty_mean": float(uncertainty_tensor.mean().item()),
         "uncertainty_max": float(uncertainty_tensor.max().item()),
+        "root_uncertainty_mean": float(root_uncertainty_tensor.mean().item()),
         "synthetic_reward_mean": float(synthetic["reward"].mean().item()),
         "synthetic_raw_reward_mean": float(raw_reward_tensor.mean().item()),
+        "synthetic_penalized_unscaled_reward_mean": float((synthetic["reward"] / float(reward_scale)).mean().item()),
         "synthetic_done_fraction": float(synthetic["terminated"].mean().item()),
+        "formula_reward": float(bool(formula_reward)),
+        "formula_done": float(bool(formula_done)),
     }
     return synthetic, metrics
 
@@ -835,6 +1163,149 @@ def _sample_from_torch_batch(batch: dict[str, torch.Tensor], batch_size: int) ->
     size = int(batch["observation"].shape[0])
     idx = torch.randint(0, size, (batch_size,), device=batch["observation"].device)
     return {key: value[idx] for key, value in batch.items()}
+
+
+def _update_actor_bc_mopo(
+    *,
+    actor: Network,
+    critic: Network,
+    temperature: Network,
+    reference_actor: FlashSACActor | None,
+    mixed_batch: dict[str, torch.Tensor],
+    real_batch: dict[str, torch.Tensor] | None,
+    synthetic_batch: dict[str, torch.Tensor] | None,
+    bc_alpha: float,
+    bc_ref_alpha: float,
+    bc_ref_on: str,
+    actor_rl_coef: float,
+    grad_clip_norm: float,
+) -> dict[str, torch.Tensor]:
+    mixed_obs = mixed_batch["actor_observation"]
+    actions, info = actor(observations=mixed_obs, training=True)
+    log_probs = info["log_prob"]
+
+    critic.network.requires_grad_(False)
+    qs, _ = critic(
+        observations=mixed_batch["observation"],
+        actions=actions,
+        training=False,
+    )
+    q = torch.minimum(qs[0], qs[1])
+    critic.network.requires_grad_(True)
+
+    temp_value = temperature().detach()
+    actor_rl_loss_raw = (log_probs * temp_value - q).mean()
+    actor_rl_loss_scaled = float(actor_rl_coef) * actor_rl_loss_raw
+    actor_bc_loss = torch.zeros((), dtype=actor_rl_loss_raw.dtype, device=actor_rl_loss_raw.device)
+    actor_bc_ref_loss = torch.zeros((), dtype=actor_rl_loss_raw.dtype, device=actor_rl_loss_raw.device)
+    deterministic_actions = actions
+    if bc_alpha > 0:
+        if real_batch is None:
+            raise ValueError("bc_alpha > 0 requires a non-empty real expert batch.")
+        mean, _ = actor.apply(
+            "get_mean_and_std",
+            observations=real_batch["actor_observation"],
+            training=True,
+        )
+        deterministic_actions = torch.tanh(mean)
+        actor_bc_loss = F.mse_loss(deterministic_actions, real_batch["action"])
+
+    if bc_ref_alpha > 0:
+        if reference_actor is None:
+            raise ValueError("bc_ref_alpha > 0 requires a frozen reference actor.")
+        if bc_ref_on == "mixed":
+            ref_batch = mixed_batch
+        elif bc_ref_on == "synthetic":
+            if synthetic_batch is None:
+                raise ValueError("bc_ref_on=synthetic requires synthetic samples in the update batch.")
+            ref_batch = synthetic_batch
+        elif bc_ref_on == "real":
+            if real_batch is None:
+                raise ValueError("bc_ref_on=real requires real expert samples in the update batch.")
+            ref_batch = real_batch
+        else:
+            raise ValueError(f"Unsupported bc_ref_on: {bc_ref_on}")
+
+        ref_obs = ref_batch["actor_observation"]
+        cur_mean, _ = actor.apply("get_mean_and_std", observations=ref_obs, training=True)
+        cur_action = torch.tanh(cur_mean)
+        with torch.no_grad():
+            ref_mean, _ = reference_actor.get_mean_and_std(ref_obs, training=False)
+            ref_action = torch.tanh(ref_mean)
+        actor_bc_ref_loss = F.mse_loss(cur_action, ref_action)
+
+    actor_total_loss = actor_rl_loss_scaled + float(bc_alpha) * actor_bc_loss + float(bc_ref_alpha) * actor_bc_ref_loss
+    actor_entropy = -log_probs.mean()
+    mean_action = deterministic_actions.mean()
+
+    assert actor.optimizer is not None
+    actor.optimizer.zero_grad(set_to_none=True)
+    actor_total_loss.backward()
+    if grad_clip_norm > 0:
+        torch.nn.utils.clip_grad_norm_(actor.network.parameters(), grad_clip_norm)
+    actor.optimizer.step()
+    if actor.scheduler is not None:
+        actor.scheduler.step()
+    actor.normalize_parameters()
+
+    return {
+        "actor/loss": actor_total_loss.detach(),
+        "actor/rl_loss": actor_rl_loss_raw.detach(),
+        "actor/rl_loss_raw": actor_rl_loss_raw.detach(),
+        "actor/rl_loss_scaled": actor_rl_loss_scaled.detach(),
+        "actor/bc_loss": actor_bc_loss.detach(),
+        "actor/bc_ref_loss": actor_bc_ref_loss.detach(),
+        "actor/entropy": actor_entropy.detach(),
+        "actor/mean_action": mean_action.detach(),
+    }
+
+
+@torch.no_grad()
+def _evaluate_actor_bc_real(
+    *,
+    actor: Network,
+    arrays: TransitionArrays,
+    device: torch.device,
+    max_transitions: int,
+    seed: int,
+) -> dict[str, float]:
+    size = arrays.size
+    if size == 0:
+        return {"mse": float("nan"), "mae": float("nan")}
+    count = min(size, max(1, int(max_transitions)))
+    rng = np.random.default_rng(seed)
+    if count < size:
+        idx_np = np.sort(rng.choice(size, size=count, replace=False))
+    else:
+        idx_np = np.arange(size)
+    obs = torch.as_tensor(arrays.observation[idx_np], dtype=torch.float32, device=device)
+    action = torch.as_tensor(arrays.action[idx_np], dtype=torch.float32, device=device)
+    mean, _ = actor.apply("get_mean_and_std", observations=obs, training=False)
+    pred_action = torch.tanh(mean)
+    error = pred_action - action
+    return {
+        "mse": float(torch.mean(error.square()).item()),
+        "mae": float(torch.mean(torch.abs(error)).item()),
+    }
+
+
+@torch.no_grad()
+def _evaluate_actor_reference_mse(
+    *,
+    actor: Network,
+    reference_actor: FlashSACActor | None,
+    batch: dict[str, torch.Tensor] | None,
+) -> float:
+    if reference_actor is None or batch is None:
+        return float("nan")
+    obs = batch["actor_observation"]
+    if obs.numel() == 0:
+        return float("nan")
+    mean, _ = actor.apply("get_mean_and_std", observations=obs, training=False)
+    action = torch.tanh(mean)
+    ref_mean, _ = reference_actor.get_mean_and_std(obs, training=False)
+    ref_action = torch.tanh(ref_mean)
+    return float(F.mse_loss(action, ref_action).item())
 
 
 def _train_dynamics(
@@ -851,6 +1322,22 @@ def _train_dynamics(
     train_delta = torch.as_tensor(train.next_observation - train.observation, dtype=torch.float32, device=device)
     train_reward = torch.as_tensor(train.reward, dtype=torch.float32, device=device)
     train_done = torch.as_tensor(train.terminated, dtype=torch.float32, device=device)
+    train_qpos_root = (
+        None if train.qpos_root is None else torch.as_tensor(train.qpos_root, dtype=torch.float32, device=device)
+    )
+    train_qvel_root = (
+        None if train.qvel_root is None else torch.as_tensor(train.qvel_root, dtype=torch.float32, device=device)
+    )
+    train_delta_qpos_root = None
+    train_delta_qvel_root = None
+    if train.qpos_root is not None and train.next_qpos_root is not None:
+        train_delta_qpos_root = torch.as_tensor(
+            train.next_qpos_root - train.qpos_root, dtype=torch.float32, device=device
+        )
+    if train.qvel_root is not None and train.next_qvel_root is not None:
+        train_delta_qvel_root = torch.as_tensor(
+            train.next_qvel_root - train.qvel_root, dtype=torch.float32, device=device
+        )
     val_obs = torch.as_tensor(val.observation, dtype=torch.float32, device=device)
     val_action = torch.as_tensor(val.action, dtype=torch.float32, device=device)
     val_delta = torch.as_tensor(val.next_observation - val.observation, dtype=torch.float32, device=device)
@@ -865,16 +1352,37 @@ def _train_dynamics(
 
     losses: list[float] = []
     delta_losses: list[float] = []
+    qpos_root_losses: list[float] = []
+    qvel_root_losses: list[float] = []
     reward_losses: list[float] = []
     done_losses: list[float] = []
     dynamics.train()
     for _ in range(total_steps):
         idx = torch.randint(0, train.size, (min(args.model_batch_size, train.size),), device=device)
-        pred = dynamics(train_obs[idx], train_action[idx])
-        delta, reward, done_logit = dynamics.split_prediction(pred)
+        pred = dynamics(
+            train_obs[idx],
+            train_action[idx],
+            None if train_qpos_root is None else train_qpos_root[idx],
+            None if train_qvel_root is None else train_qvel_root[idx],
+        )
+        delta, delta_qpos_root, delta_qvel_root, reward, done_logit = dynamics.split_prediction(pred)
         delta_target = train_delta[idx].unsqueeze(0).expand_as(delta)
         delta_loss = F.mse_loss(delta, delta_target)
         loss = delta_loss
+        qpos_root_loss = torch.zeros((), device=device)
+        qvel_root_loss = torch.zeros((), device=device)
+        if dynamics.predict_root:
+            if train_delta_qpos_root is None or train_delta_qvel_root is None:
+                raise ValueError("Root-aware dynamics training requires next_qpos_root and next_qvel_root.")
+            assert delta_qpos_root is not None and delta_qvel_root is not None
+            qpos_target = train_delta_qpos_root[idx].unsqueeze(0).expand_as(delta_qpos_root)
+            qvel_target = train_delta_qvel_root[idx].unsqueeze(0).expand_as(delta_qvel_root)
+            qpos_xyz_loss = F.mse_loss(delta_qpos_root[..., :3], qpos_target[..., :3])
+            qpos_quat_loss = F.mse_loss(delta_qpos_root[..., 3:7], qpos_target[..., 3:7])
+            qpos_root_loss = qpos_xyz_loss + float(args.quat_loss_coef) * qpos_quat_loss
+            qvel_root_loss = F.mse_loss(delta_qvel_root, qvel_target)
+            loss = loss + float(args.root_loss_coef) * float(args.qpos_root_loss_coef) * qpos_root_loss
+            loss = loss + float(args.root_loss_coef) * float(args.qvel_root_loss_coef) * qvel_root_loss
         reward_loss = torch.zeros((), device=device)
         done_loss = torch.zeros((), device=device)
         if reward is not None:
@@ -894,6 +1402,8 @@ def _train_dynamics(
         optimizer.step()
         losses.append(float(loss.item()))
         delta_losses.append(float(delta_loss.item()))
+        qpos_root_losses.append(float(qpos_root_loss.item()))
+        qvel_root_losses.append(float(qvel_root_loss.item()))
         reward_losses.append(float(reward_loss.item()))
         done_losses.append(float(done_loss.item()))
 
@@ -904,13 +1414,26 @@ def _train_dynamics(
         delta=val_delta,
         reward=val_reward,
         done=val_done,
+        qpos_root=None if val.qpos_root is None else torch.as_tensor(val.qpos_root, dtype=torch.float32, device=device),
+        qvel_root=None if val.qvel_root is None else torch.as_tensor(val.qvel_root, dtype=torch.float32, device=device),
+        next_qpos_root=None
+        if val.next_qpos_root is None
+        else torch.as_tensor(val.next_qpos_root, dtype=torch.float32, device=device),
+        next_qvel_root=None
+        if val.next_qvel_root is None
+        else torch.as_tensor(val.next_qvel_root, dtype=torch.float32, device=device),
         obs_mean=torch.as_tensor(args._obs_mean, dtype=torch.float32, device=device),
         obs_std=torch.as_tensor(args._obs_std, dtype=torch.float32, device=device),
         force_last_action=args.force_last_action,
+        formula_reward=bool(args.formula_reward),
+        formula_done=bool(args.formula_done),
+        observable_reward_context=getattr(args, "_observable_reward_context", None),
     )
     train_metrics = {
         "dynamics_loss": float(np.mean(losses)),
         "dynamics_delta_loss": float(np.mean(delta_losses)),
+        "dynamics_qpos_root_loss": float(np.mean(qpos_root_losses)),
+        "dynamics_qvel_root_loss": float(np.mean(qvel_root_losses)),
         "dynamics_reward_loss": float(np.mean(reward_losses)),
         "dynamics_done_loss": float(np.mean(done_losses)),
         "dynamics_steps": int(total_steps),
@@ -927,13 +1450,22 @@ def _evaluate_dynamics(
     delta: torch.Tensor,
     reward: torch.Tensor,
     done: torch.Tensor,
+    qpos_root: torch.Tensor | None,
+    qvel_root: torch.Tensor | None,
+    next_qpos_root: torch.Tensor | None,
+    next_qvel_root: torch.Tensor | None,
     obs_mean: torch.Tensor,
     obs_std: torch.Tensor,
     force_last_action: bool,
+    formula_reward: bool,
+    formula_done: bool,
+    observable_reward_context: dict[str, Any] | None,
 ) -> dict[str, Any]:
     dynamics.eval()
-    pred = dynamics(obs, action)
-    pred_delta, pred_reward, pred_done_logit = dynamics.split_prediction(pred)
+    pred = dynamics(obs, action, qpos_root, qvel_root)
+    pred_delta, pred_delta_qpos_root, pred_delta_qvel_root, pred_reward, pred_done_logit = dynamics.split_prediction(
+        pred
+    )
     next_pred = obs.unsqueeze(0) + pred_delta
     next_pred = torch.stack(
         [
@@ -955,11 +1487,54 @@ def _evaluate_dynamics(
         "next_obs_mse": float(torch.mean(error.square()).item()),
         "next_obs_mae": float(torch.mean(torch.abs(error)).item()),
         "uncertainty_mean": float(next_pred.var(dim=0).mean(dim=-1).mean().item()),
-        "chunk_mse": {
-            name: float(torch.mean(error[:, slc].square()).item())
-            for name, slc in SLICES.items()
-        },
+        "chunk_mse": {name: float(torch.mean(error[:, slc].square()).item()) for name, slc in SLICES.items()},
     }
+    if dynamics.predict_root:
+        if qpos_root is None or qvel_root is None or next_qpos_root is None or next_qvel_root is None:
+            raise ValueError("Root-aware dynamics evaluation requires root current and next arrays.")
+        assert pred_delta_qpos_root is not None and pred_delta_qvel_root is not None
+        next_qpos_pred = _normalize_root_quat(qpos_root.unsqueeze(0) + pred_delta_qpos_root)
+        next_qvel_pred = qvel_root.unsqueeze(0) + pred_delta_qvel_root
+        qpos_error = next_qpos_pred.mean(dim=0) - next_qpos_root
+        qvel_error = next_qvel_pred.mean(dim=0) - next_qvel_root
+        metrics.update(
+            {
+                "qpos_root_delta_mse": float(
+                    F.mse_loss(pred_delta_qpos_root.mean(dim=0), next_qpos_root - qpos_root).item()
+                ),
+                "qvel_root_delta_mse": float(
+                    F.mse_loss(pred_delta_qvel_root.mean(dim=0), next_qvel_root - qvel_root).item()
+                ),
+                "qpos_root_next_mse": float(torch.mean(qpos_error.square()).item()),
+                "qvel_root_next_mse": float(torch.mean(qvel_error.square()).item()),
+                "qpos_xyz_mse": float(torch.mean(qpos_error[:, :3].square()).item()),
+                "qpos_quat_mse": float(torch.mean(qpos_error[:, 3:7].square()).item()),
+                "qvel_root_mse": float(torch.mean(qvel_error.square()).item()),
+                "root_uncertainty_mean": float(
+                    (next_qpos_pred.var(dim=0).mean(dim=-1) + next_qvel_pred.var(dim=0).mean(dim=-1)).mean().item()
+                ),
+            }
+        )
+        if formula_reward or formula_done:
+            if observable_reward_context is None:
+                raise ValueError("Formula reward/done evaluation requires observable reward context.")
+            member_idx = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
+            row_idx = torch.arange(obs.shape[0], device=obs.device)
+            reward_formula, done_formula, _ = _compute_observable_reward_torch(
+                obs_t_norm=obs,
+                act_t=action,
+                obs_tp1_norm=next_pred[member_idx, row_idx],
+                qpos_root_tp1=next_qpos_pred[member_idx, row_idx],
+                qvel_root_tp1=next_qvel_pred[member_idx, row_idx],
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+                context=observable_reward_context,
+            )
+            metrics["formula_reward_mse"] = float(F.mse_loss(reward_formula, reward).item())
+            metrics["formula_reward_mae"] = float(F.l1_loss(reward_formula, reward).item())
+            metrics["formula_done_accuracy"] = float(((done_formula > 0.5) == (done > 0.5)).float().mean().item())
+            metrics["formula_done_pred_rate"] = float((done_formula > 0.5).float().mean().item())
+            metrics["formula_done_label_rate"] = float((done > 0.5).float().mean().item())
     if pred_reward is not None:
         metrics["reward_mse"] = float(F.mse_loss(pred_reward.mean(dim=0), reward).item())
     if pred_done_logit is not None:
@@ -985,9 +1560,24 @@ def _evaluate_dynamics_arrays(
         delta=torch.as_tensor(arrays.next_observation - arrays.observation, dtype=torch.float32, device=device),
         reward=torch.as_tensor(arrays.reward, dtype=torch.float32, device=device),
         done=torch.as_tensor(arrays.terminated, dtype=torch.float32, device=device),
+        qpos_root=None
+        if arrays.qpos_root is None
+        else torch.as_tensor(arrays.qpos_root, dtype=torch.float32, device=device),
+        qvel_root=None
+        if arrays.qvel_root is None
+        else torch.as_tensor(arrays.qvel_root, dtype=torch.float32, device=device),
+        next_qpos_root=None
+        if arrays.next_qpos_root is None
+        else torch.as_tensor(arrays.next_qpos_root, dtype=torch.float32, device=device),
+        next_qvel_root=None
+        if arrays.next_qvel_root is None
+        else torch.as_tensor(arrays.next_qvel_root, dtype=torch.float32, device=device),
         obs_mean=torch.as_tensor(args._obs_mean, dtype=torch.float32, device=device),
         obs_std=torch.as_tensor(args._obs_std, dtype=torch.float32, device=device),
         force_last_action=args.force_last_action,
+        formula_reward=bool(args.formula_reward),
+        formula_done=bool(args.formula_done),
+        observable_reward_context=getattr(args, "_observable_reward_context", None),
     )
 
 
@@ -996,16 +1586,19 @@ def _make_flashsac_networks(
     device: torch.device,
     args: argparse.Namespace,
 ) -> tuple[Network, Network, Network, Network]:
+    actor_lr = args.lr if args.actor_lr is None else args.actor_lr
+    critic_lr = args.lr if args.critic_lr is None else args.critic_lr
+    temperature_lr = args.lr if args.temperature_lr is None else args.temperature_lr
     actor_net = _make_actor(device)
     if args.bc_checkpoint is not None:
         _load_actor_checkpoint(actor_net, args.bc_checkpoint.expanduser().resolve(), device)
     actor = _make_network_bundle(
         actor_net,
-        lr=args.lr,
+        lr=actor_lr,
         weight_decay=args.weight_decay,
-        use_weight_normalization=True,
+        use_weight_normalization=args.actor_weight_normalization,
     )
-    if args.bc_checkpoint is None:
+    if args.bc_checkpoint is None and args.actor_weight_normalization:
         actor.normalize_parameters()
 
     critic_net = FlashSACDoubleCritic(
@@ -1018,7 +1611,7 @@ def _make_flashsac_networks(
     ).to(device)
     critic = _make_network_bundle(
         critic_net,
-        lr=args.lr,
+        lr=critic_lr,
         weight_decay=args.weight_decay,
         use_weight_normalization=True,
     )
@@ -1045,7 +1638,7 @@ def _make_flashsac_networks(
 
     temperature = _make_network_bundle(
         FlashSACTemperature(args.alpha).to(device),
-        lr=args.lr,
+        lr=temperature_lr,
         weight_decay=0.0,
         use_weight_normalization=False,
     )
@@ -1064,6 +1657,7 @@ def _save_checkpoint(
     epoch: int,
     obs_mean: np.ndarray,
     obs_std: np.ndarray,
+    root_stats: dict[str, np.ndarray],
     args: argparse.Namespace,
     metrics: dict[str, Any],
 ) -> None:
@@ -1082,12 +1676,14 @@ def _save_checkpoint(
             "config": config,
             "obs_dim": hrlg.POLICY_OBS_SIZE,
             "action_dim": hrlg.ACTION_SIZE,
+            "predict_root": bool(dynamics.predict_root),
             "predict_reward": bool(dynamics.predict_reward),
             "predict_done": bool(dynamics.predict_done),
         },
         path / "dynamics_ensemble.pt",
     )
     np.savez(path / "obs_stats.npz", mean=obs_mean, std=obs_std, enabled=np.array(bool(args.normalize_obs)))
+    np.savez(path / "root_stats.npz", **root_stats)
     _write_json(path / "checkpoint_metrics.json", metrics)
     _write_json(path / "resolved_config.json", config)
     _write_json(path / "dynamics_config.json", _dynamics_config(args, dynamics))
@@ -1106,9 +1702,16 @@ def _dynamics_config(args: argparse.Namespace, dynamics: DynamicsEnsemble) -> di
         "dynamics_layers": int(args.dynamics_layers),
         "obs_dim": int(dynamics.obs_dim),
         "action_dim": int(dynamics.action_dim),
+        "root_dim": int(dynamics.root_dim),
+        "predict_root": bool(dynamics.predict_root),
         "predict_reward": bool(dynamics.predict_reward),
         "predict_done": bool(dynamics.predict_done),
+        "predict_reward_head": bool(args.predict_reward_head),
+        "predict_done_head": bool(args.predict_done_head),
+        "formula_reward": bool(args.formula_reward),
+        "formula_done": bool(args.formula_done),
         "normalize_obs": bool(args.normalize_obs),
+        "root_stats_strategy": "saved_raw_root_stats_root_inputs_are_raw",
     }
 
 
@@ -1120,6 +1723,7 @@ def _save_dynamics_checkpoint(
     epoch: int,
     obs_mean: np.ndarray,
     obs_std: np.ndarray,
+    root_stats: dict[str, np.ndarray],
     args: argparse.Namespace,
     metrics: dict[str, Any],
 ) -> None:
@@ -1134,12 +1738,14 @@ def _save_dynamics_checkpoint(
             "config": config,
             "obs_dim": hrlg.POLICY_OBS_SIZE,
             "action_dim": hrlg.ACTION_SIZE,
+            "predict_root": bool(dynamics.predict_root),
             "predict_reward": bool(dynamics.predict_reward),
             "predict_done": bool(dynamics.predict_done),
         },
         path / "dynamics_ensemble.pt",
     )
     np.savez(path / "obs_stats.npz", mean=obs_mean, std=obs_std, enabled=np.array(bool(args.normalize_obs)))
+    np.savez(path / "root_stats.npz", **root_stats)
     _write_json(path / "checkpoint_metrics.json", metrics)
     _write_json(path / "resolved_config.json", config)
     _write_json(path / "dynamics_config.json", _dynamics_config(args, dynamics))
@@ -1243,14 +1849,16 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
     device = _resolve_device(args.device)
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.reward_scale <= 0:
+        raise ValueError("--reward-scale must be positive.")
+    if args.bc_alpha > 0 and args.real_ratio <= 0:
+        raise ValueError("--bc-alpha > 0 requires --real-ratio > 0 so BC loss can use real expert samples.")
     if args.skip_dynamics_training and args.dynamics_checkpoint is None:
         raise ValueError("--skip-dynamics-training requires --dynamics-checkpoint.")
     if args.dynamics_only and args.skip_dynamics_training:
         raise ValueError("--dynamics-only cannot be combined with --skip-dynamics-training.")
     dynamics_checkpoint = (
-        _resolve_dynamics_checkpoint(args.dynamics_checkpoint)
-        if args.dynamics_checkpoint is not None
-        else None
+        _resolve_dynamics_checkpoint(args.dynamics_checkpoint) if args.dynamics_checkpoint is not None else None
     )
 
     train_raw, val_raw, split, relabel_info = _load_transitions(
@@ -1281,11 +1889,27 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
         obs_std = np.ones(hrlg.POLICY_OBS_SIZE, dtype=np.float32)
     args._obs_mean = obs_mean
     args._obs_std = obs_std
+    root_stats = (
+        _load_root_stats_from_dynamics_checkpoint(dynamics_checkpoint)
+        if dynamics_checkpoint is not None
+        else _fit_root_stats(train_raw.qpos_root, train_raw.qvel_root)
+    )
+    args._root_stats = {
+        key: (value.tolist() if isinstance(value, np.ndarray) else value) for key, value in root_stats.items()
+    }
+    if args.predict_root and (train_raw.qpos_root is None or train_raw.qvel_root is None):
+        raise ValueError("--predict-root requires qpos_root and qvel_root in the dataset.")
+    if (args.formula_reward or args.formula_done) and not args.predict_root:
+        raise ValueError("--formula-reward/--formula-done require --predict-root.")
 
     train = _normalize(train_raw, obs_mean, obs_std)
     val = _normalize(val_raw, obs_mean, obs_std)
     obs_mean_t = torch.as_tensor(obs_mean, dtype=torch.float32, device=device)
     obs_std_t = torch.as_tensor(obs_std, dtype=torch.float32, device=device)
+    if args.formula_reward or args.formula_done:
+        args._observable_reward_context = _make_observable_reward_context(device)
+    else:
+        args._observable_reward_context = None
 
     split_info = asdict(split)
     args._split_info = split_info
@@ -1307,6 +1931,11 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
         "uses_pretrained_dynamics": dynamics_checkpoint is not None,
         "skip_dynamics_training": bool(args.skip_dynamics_training),
         "dynamics_only": bool(args.dynamics_only),
+        "predict_root": bool(args.predict_root),
+        "predict_reward_head": bool(args.predict_reward_head),
+        "predict_done_head": bool(args.predict_done_head),
+        "formula_reward": bool(args.formula_reward),
+        "formula_done": bool(args.formula_done),
         "split_by": "trajectory",
         "reward_relabel": relabel_info,
         "current_dataset_limitation": (
@@ -1326,8 +1955,9 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
         action_dim=hrlg.ACTION_SIZE,
         hidden_dim=args.dynamics_hidden_dim,
         layers=args.dynamics_layers,
-        predict_reward=split.reward_available,
-        predict_done=split.done_available,
+        predict_root=bool(args.predict_root),
+        predict_reward=bool(split.reward_available and args.predict_reward_head),
+        predict_done=bool(split.done_available and args.predict_done_head),
     ).to(device)
 
     loaded_dynamics_metrics: dict[str, Any] | None = None
@@ -1338,6 +1968,8 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
         dynamics_train_metrics = {
             "dynamics_loss": float("nan"),
             "dynamics_delta_loss": float("nan"),
+            "dynamics_qpos_root_loss": float("nan"),
+            "dynamics_qvel_root_loss": float("nan"),
             "dynamics_reward_loss": float("nan"),
             "dynamics_done_loss": float("nan"),
             "dynamics_steps": 0,
@@ -1386,6 +2018,7 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                 epoch=0,
                 obs_mean=obs_mean,
                 obs_std=obs_std,
+                root_stats=root_stats,
                 args=args,
                 metrics=metrics,
             )
@@ -1394,6 +2027,15 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
         return metrics
 
     actor, critic, target_critic, temperature = _make_flashsac_networks(device=device, args=args)
+    reference_actor: FlashSACActor | None = None
+    if args.bc_ref_alpha > 0:
+        if args.bc_checkpoint is None:
+            raise ValueError("--bc-ref-alpha > 0 requires --bc-checkpoint.")
+        reference_actor = _make_actor(device)
+        _load_actor_checkpoint(reference_actor, args.bc_checkpoint.expanduser().resolve(), device)
+        reference_actor.eval()
+        for param in reference_actor.parameters():
+            param.requires_grad_(False)
 
     progress_path = output_dir / "progress.csv"
     log_path = output_dir / "train.log"
@@ -1405,26 +2047,48 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
     online_eval_metrics: list[dict[str, Any]] = []
     metric_lists: dict[str, list[float]] = {
         "train_actor_loss": [],
+        "train_actor_rl_loss": [],
+        "train_actor_rl_loss_scaled": [],
         "train_critic_loss": [],
         "train_bc_loss": [],
+        "train_bc_ref_loss": [],
         "temperature_loss": [],
         "uncertainty_mean": [],
         "synthetic_reward_mean": [],
+        "offline_bc_mse_real": [],
+        "offline_bc_mae_real": [],
+        "offline_ref_mse_mixed": [],
     }
 
     fieldnames = [
         "epoch",
         "update",
         "train_actor_loss",
+        "train_actor_rl_loss",
+        "train_actor_rl_loss_raw",
+        "train_actor_rl_loss_scaled",
         "train_critic_loss",
         "train_bc_loss",
+        "train_bc_ref_loss",
+        "train_bc_ref_alpha",
+        "actor_rl_coef",
+        "critic_warmup_active",
+        "offline_bc_mse_real",
+        "offline_bc_mae_real",
+        "offline_ref_mse_mixed",
         "temperature_loss",
         "dynamics_train_loss",
         "dynamics_val_loss",
         "dynamics_reward_loss",
         "dynamics_done_loss",
         "uncertainty_mean",
+        "root_uncertainty_mean",
         "synthetic_return_mean",
+        "dynamics_qpos_root_loss",
+        "dynamics_qvel_root_loss",
+        "dynamics_qpos_root_next_mse",
+        "dynamics_qvel_root_next_mse",
+        "formula_reward_mae",
         "online_avg_return",
         "online_avg_length",
         "online_survived_full",
@@ -1442,6 +2106,22 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
         epoch=0,
         obs_mean=obs_mean,
         obs_std=obs_std,
+        root_stats=root_stats,
+        args=args,
+        metrics={"dynamics_val_metrics": dynamics_val_metrics, "dynamics_train_metrics": dynamics_train_metrics},
+    )
+    _save_checkpoint(
+        output_dir / "epoch_0000",
+        actor=actor,
+        critic=critic,
+        target_critic=target_critic,
+        temperature=temperature,
+        dynamics=dynamics,
+        update_step=update_step,
+        epoch=0,
+        obs_mean=obs_mean,
+        obs_std=obs_std,
+        root_stats=root_stats,
         args=args,
         metrics={"dynamics_val_metrics": dynamics_val_metrics, "dynamics_train_metrics": dynamics_train_metrics},
     )
@@ -1452,6 +2132,101 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
     ):
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
+        initial_bc_metrics = _evaluate_actor_bc_real(
+            actor=actor,
+            arrays=train,
+            device=device,
+            max_transitions=args.offline_bc_eval_transitions,
+            seed=args.seed + 50_000,
+        )
+        metric_lists["offline_bc_mse_real"].append(initial_bc_metrics["mse"])
+        metric_lists["offline_bc_mae_real"].append(initial_bc_metrics["mae"])
+        initial_ref_batch = None
+        if reference_actor is not None:
+            initial_ref_batch = _make_real_batch(
+                train,
+                min(train.size, args.offline_bc_eval_transitions),
+                device,
+                reward_scale=args.reward_scale,
+            )
+        initial_ref_mse = _evaluate_actor_reference_mse(
+            actor=actor,
+            reference_actor=reference_actor,
+            batch=initial_ref_batch,
+        )
+        metric_lists["offline_ref_mse_mixed"].append(initial_ref_mse)
+        initial_online_metrics = None
+        if args.online_eval_interval > 0:
+            initial_online_metrics = _run_online_eval(
+                output_dir / "epoch_0000",
+                args=args,
+                epoch=0,
+                update_step=0,
+                output_dir=output_dir,
+            )
+            online_eval_metrics.append(initial_online_metrics)
+            if _online_better(initial_online_metrics, best_online):
+                best_online = initial_online_metrics
+                _save_checkpoint(
+                    output_dir / "best_online",
+                    actor=actor,
+                    critic=critic,
+                    target_critic=target_critic,
+                    temperature=temperature,
+                    dynamics=dynamics,
+                    update_step=0,
+                    epoch=0,
+                    obs_mean=obs_mean,
+                    obs_std=obs_std,
+                    root_stats=root_stats,
+                    args=args,
+                    metrics={"online_eval": initial_online_metrics, "initial_bc_metrics": initial_bc_metrics},
+                )
+        initial_row = {
+            "epoch": 0,
+            "update": 0,
+            "train_actor_loss": float("nan"),
+            "train_actor_rl_loss": float("nan"),
+            "train_actor_rl_loss_raw": float("nan"),
+            "train_actor_rl_loss_scaled": float("nan"),
+            "train_critic_loss": float("nan"),
+            "train_bc_loss": float("nan"),
+            "train_bc_ref_loss": float("nan"),
+            "train_bc_ref_alpha": float(args.bc_ref_alpha),
+            "actor_rl_coef": float(args.actor_rl_coef),
+            "critic_warmup_active": 0,
+            "offline_bc_mse_real": initial_bc_metrics["mse"],
+            "offline_bc_mae_real": initial_bc_metrics["mae"],
+            "offline_ref_mse_mixed": initial_ref_mse,
+            "temperature_loss": float("nan"),
+            "dynamics_train_loss": float(dynamics_train_metrics["dynamics_loss"]),
+            "dynamics_val_loss": float(dynamics_val_metrics["next_obs_mse"]),
+            "dynamics_reward_loss": float(dynamics_train_metrics["dynamics_reward_loss"]),
+            "dynamics_done_loss": float(dynamics_train_metrics["dynamics_done_loss"]),
+            "uncertainty_mean": float("nan"),
+            "root_uncertainty_mean": float("nan"),
+            "synthetic_return_mean": float("nan"),
+            "dynamics_qpos_root_loss": float(dynamics_train_metrics.get("dynamics_qpos_root_loss", float("nan"))),
+            "dynamics_qvel_root_loss": float(dynamics_train_metrics.get("dynamics_qvel_root_loss", float("nan"))),
+            "dynamics_qpos_root_next_mse": float(dynamics_val_metrics.get("qpos_root_next_mse", float("nan"))),
+            "dynamics_qvel_root_next_mse": float(dynamics_val_metrics.get("qvel_root_next_mse", float("nan"))),
+            "formula_reward_mae": float(dynamics_val_metrics.get("formula_reward_mae", float("nan"))),
+            "online_avg_return": float("nan")
+            if initial_online_metrics is None
+            else float(initial_online_metrics["avg_return"]),
+            "online_avg_length": float("nan")
+            if initial_online_metrics is None
+            else float(initial_online_metrics["avg_length"]),
+            "online_survived_full": ""
+            if initial_online_metrics is None
+            else int(initial_online_metrics["survived_full"]),
+            "wall_time_sec": float(time.perf_counter() - start_time),
+        }
+        writer.writerow(initial_row)
+        csv_file.flush()
+        print(json.dumps(initial_row, sort_keys=True))
+
+        epoch = 0
         for epoch in range(1, args.epochs + 1):
             start_count = max(1, int(round(args.rollout_batch_size * args.model_rollout_ratio)))
             start_idx = torch.randint(0, train.size, (min(start_count, train.size),), device=device)
@@ -1460,16 +2235,37 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                 dtype=torch.float32,
                 device=device,
             )
+            start_np_idx = start_idx.detach().cpu().numpy()
+            start_qpos_root = None
+            start_qvel_root = None
+            if args.predict_root:
+                assert train.qpos_root is not None and train.qvel_root is not None
+                start_qpos_root = torch.as_tensor(
+                    train.qpos_root[start_np_idx],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                start_qvel_root = torch.as_tensor(
+                    train.qvel_root[start_np_idx],
+                    dtype=torch.float32,
+                    device=device,
+                )
             synthetic_batch, rollout_metrics = _generate_model_rollouts(
                 actor=actor,
                 dynamics=dynamics,
                 start_obs=start_obs,
+                start_qpos_root=start_qpos_root,
+                start_qvel_root=start_qvel_root,
                 rollout_horizon=args.rollout_horizon,
                 mopo_penalty_coef=args.mopo_penalty_coef,
                 obs_mean=obs_mean_t,
                 obs_std=obs_std_t,
                 force_last_action=args.force_last_action,
                 done_threshold=args.done_threshold,
+                reward_scale=args.reward_scale,
+                formula_reward=bool(args.formula_reward),
+                formula_done=bool(args.formula_done),
+                observable_reward_context=getattr(args, "_observable_reward_context", None),
             )
             metric_lists["uncertainty_mean"].append(rollout_metrics["uncertainty_mean"])
             metric_lists["synthetic_reward_mean"].append(rollout_metrics["synthetic_reward_mean"])
@@ -1477,19 +2273,32 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
             updates_per_epoch = args.updates_per_epoch
             if updates_per_epoch is None:
                 updates_per_epoch = max(1, math.ceil(train.size / args.batch_size))
+            critic_warmup_active = epoch <= int(args.critic_warmup_epochs)
             epoch_actor_losses = []
+            epoch_actor_rl_losses = []
+            epoch_actor_rl_scaled_losses = []
             epoch_critic_losses = []
             epoch_bc_losses = []
+            epoch_bc_ref_losses = []
             epoch_temp_losses = []
             for _ in range(updates_per_epoch):
                 real_count = int(round(args.batch_size * args.real_ratio))
                 real_count = min(args.batch_size, max(0, real_count))
                 synthetic_count = args.batch_size - real_count
                 batches = []
+                real_batch = None
+                synthetic_update_batch = None
                 if real_count > 0:
-                    batches.append(_make_real_batch(train, real_count, device))
+                    real_batch = _make_real_batch(
+                        train,
+                        real_count,
+                        device,
+                        reward_scale=args.reward_scale,
+                    )
+                    batches.append(real_batch)
                 if synthetic_count > 0:
-                    batches.append(_sample_from_torch_batch(synthetic_batch, synthetic_count))
+                    synthetic_update_batch = _sample_from_torch_batch(synthetic_batch, synthetic_count)
+                    batches.append(synthetic_update_batch)
                 batch = _concat_batches(batches) if len(batches) > 1 else batches[0]
 
                 critic_info = update_critic(
@@ -1509,16 +2318,30 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 actor_info: dict[str, torch.Tensor] = {}
                 temperature_info: dict[str, torch.Tensor] = {}
-                if update_step % args.actor_update_period == 0:
-                    actor_info = update_actor(
+                if critic_warmup_active:
+                    if args.auto_alpha:
+                        with torch.no_grad():
+                            _, warmup_info = actor(observations=batch["actor_observation"], training=True)
+                            warmup_entropy = -warmup_info["log_prob"].mean()
+                        temperature_info = update_temperature(
+                            temperature=temperature,
+                            entropy=warmup_entropy,
+                            target_entropy=args.target_entropy,
+                        )
+                elif update_step % args.actor_update_period == 0:
+                    actor_info = _update_actor_bc_mopo(
                         actor=actor,
                         critic=critic,
                         temperature=temperature,
-                        batch=batch,  # type: ignore[arg-type]
+                        reference_actor=reference_actor,
+                        mixed_batch=batch,
+                        real_batch=real_batch,
+                        synthetic_batch=synthetic_update_batch,
                         bc_alpha=args.bc_alpha,
-                        device=device,
-                        use_amp=False,
-                        grad_scaler=None,
+                        bc_ref_alpha=args.bc_ref_alpha,
+                        bc_ref_on=args.bc_ref_on,
+                        actor_rl_coef=args.actor_rl_coef,
+                        grad_clip_norm=args.grad_clip_norm,
                     )
                     if args.auto_alpha:
                         temperature_info = update_temperature(
@@ -1533,7 +2356,15 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                     "step": update_step,
                     "critic/loss": float(critic_info["critic/loss"].item()),
                     "actor/loss": float(actor_info["actor/loss"].item()) if actor_info else float("nan"),
+                    "actor/rl_loss": float(actor_info["actor/rl_loss"].item()) if actor_info else float("nan"),
+                    "actor/rl_loss_raw": float(actor_info["actor/rl_loss_raw"].item()) if actor_info else float("nan"),
+                    "actor/rl_loss_scaled": float(actor_info["actor/rl_loss_scaled"].item())
+                    if actor_info
+                    else float("nan"),
+                    "actor/bc_loss": float(actor_info["actor/bc_loss"].item()) if actor_info else float("nan"),
+                    "actor/bc_ref_loss": float(actor_info["actor/bc_ref_loss"].item()) if actor_info else float("nan"),
                     "actor/entropy": float(actor_info["actor/entropy"].item()) if actor_info else float("nan"),
+                    "critic_warmup_active": float(critic_warmup_active),
                     "temperature/loss": float(temperature_info["temperature/loss"].item())
                     if temperature_info
                     else float("nan"),
@@ -1545,12 +2376,16 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                 if actor_info:
                     epoch_actor_losses.append(record["actor/loss"])
                     metric_lists["train_actor_loss"].append(record["actor/loss"])
+                    epoch_actor_rl_losses.append(record["actor/rl_loss"])
+                    metric_lists["train_actor_rl_loss"].append(record["actor/rl_loss"])
+                    epoch_actor_rl_scaled_losses.append(record["actor/rl_loss_scaled"])
+                    metric_lists["train_actor_rl_loss_scaled"].append(record["actor/rl_loss_scaled"])
                     if args.bc_alpha > 0:
-                        with torch.no_grad():
-                            pred_action, _ = actor(batch["actor_observation"], training=False)
-                            bc_loss = float(F.mse_loss(pred_action, batch["action"]).item())
-                        epoch_bc_losses.append(bc_loss)
-                        metric_lists["train_bc_loss"].append(bc_loss)
+                        epoch_bc_losses.append(record["actor/bc_loss"])
+                        metric_lists["train_bc_loss"].append(record["actor/bc_loss"])
+                    if args.bc_ref_alpha > 0:
+                        epoch_bc_ref_losses.append(record["actor/bc_ref_loss"])
+                        metric_lists["train_bc_ref_loss"].append(record["actor/bc_ref_loss"])
                 if temperature_info:
                     epoch_temp_losses.append(record["temperature/loss"])
                     metric_lists["temperature_loss"].append(record["temperature/loss"])
@@ -1558,6 +2393,38 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                 if args.max_train_steps is not None and update_step >= args.max_train_steps:
                     stop_training = True
                     break
+
+            offline_bc_metrics = _evaluate_actor_bc_real(
+                actor=actor,
+                arrays=train,
+                device=device,
+                max_transitions=args.offline_bc_eval_transitions,
+                seed=args.seed + 50_000 + epoch,
+            )
+            metric_lists["offline_bc_mse_real"].append(offline_bc_metrics["mse"])
+            metric_lists["offline_bc_mae_real"].append(offline_bc_metrics["mae"])
+            ref_eval_batch = None
+            if reference_actor is not None:
+                ref_eval_parts = []
+                ref_eval_total = min(
+                    args.offline_bc_eval_transitions, train.size + synthetic_batch["observation"].shape[0]
+                )
+                ref_real_count = min(train.size, max(1, ref_eval_total // 2))
+                ref_synth_count = max(0, ref_eval_total - ref_real_count)
+                if ref_real_count > 0:
+                    ref_eval_parts.append(
+                        _make_real_batch(train, ref_real_count, device, reward_scale=args.reward_scale)
+                    )
+                if ref_synth_count > 0:
+                    ref_eval_parts.append(_sample_from_torch_batch(synthetic_batch, ref_synth_count))
+                if ref_eval_parts:
+                    ref_eval_batch = _concat_batches(ref_eval_parts) if len(ref_eval_parts) > 1 else ref_eval_parts[0]
+            offline_ref_mse_mixed = _evaluate_actor_reference_mse(
+                actor=actor,
+                reference_actor=reference_actor,
+                batch=ref_eval_batch,
+            )
+            metric_lists["offline_ref_mse_mixed"].append(offline_ref_mse_mixed)
 
             online_metrics = None
             if args.online_eval_interval > 0 and (
@@ -1568,6 +2435,7 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                     "dynamics_val_metrics": dynamics_val_metrics,
                     "dynamics_train_metrics": dynamics_train_metrics,
                     "rollout_metrics": rollout_metrics,
+                    "offline_bc_metrics": offline_bc_metrics,
                 }
                 _save_checkpoint(
                     eval_checkpoint,
@@ -1580,6 +2448,7 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                     epoch=epoch,
                     obs_mean=obs_mean,
                     obs_std=obs_std,
+                    root_stats=root_stats,
                     args=args,
                     metrics=current_metrics,
                 )
@@ -1604,8 +2473,13 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                         epoch=epoch,
                         obs_mean=obs_mean,
                         obs_std=obs_std,
+                        root_stats=root_stats,
                         args=args,
-                        metrics={"online_eval": online_metrics, "rollout_metrics": rollout_metrics},
+                        metrics={
+                            "online_eval": online_metrics,
+                            "rollout_metrics": rollout_metrics,
+                            "offline_bc_metrics": offline_bc_metrics,
+                        },
                     )
 
             if epoch == 1 or epoch % args.save_interval == 0 or stop_training or epoch == args.epochs:
@@ -1620,11 +2494,13 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                     epoch=epoch,
                     obs_mean=obs_mean,
                     obs_std=obs_std,
+                    root_stats=root_stats,
                     args=args,
                     metrics={
                         "dynamics_val_metrics": dynamics_val_metrics,
                         "dynamics_train_metrics": dynamics_train_metrics,
                         "rollout_metrics": rollout_metrics,
+                        "offline_bc_metrics": offline_bc_metrics,
                     },
                 )
 
@@ -1632,15 +2508,37 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                 "epoch": epoch,
                 "update": update_step,
                 "train_actor_loss": float(np.nanmean(epoch_actor_losses)) if epoch_actor_losses else float("nan"),
+                "train_actor_rl_loss": float(np.nanmean(epoch_actor_rl_losses))
+                if epoch_actor_rl_losses
+                else float("nan"),
+                "train_actor_rl_loss_raw": float(np.nanmean(epoch_actor_rl_losses))
+                if epoch_actor_rl_losses
+                else float("nan"),
+                "train_actor_rl_loss_scaled": float(np.nanmean(epoch_actor_rl_scaled_losses))
+                if epoch_actor_rl_scaled_losses
+                else float("nan"),
                 "train_critic_loss": float(np.mean(epoch_critic_losses)) if epoch_critic_losses else float("nan"),
                 "train_bc_loss": float(np.mean(epoch_bc_losses)) if epoch_bc_losses else float("nan"),
+                "train_bc_ref_loss": float(np.mean(epoch_bc_ref_losses)) if epoch_bc_ref_losses else float("nan"),
+                "train_bc_ref_alpha": float(args.bc_ref_alpha),
+                "actor_rl_coef": float(args.actor_rl_coef),
+                "critic_warmup_active": int(critic_warmup_active),
+                "offline_bc_mse_real": offline_bc_metrics["mse"],
+                "offline_bc_mae_real": offline_bc_metrics["mae"],
+                "offline_ref_mse_mixed": offline_ref_mse_mixed,
                 "temperature_loss": float(np.nanmean(epoch_temp_losses)) if epoch_temp_losses else float("nan"),
                 "dynamics_train_loss": float(dynamics_train_metrics["dynamics_loss"]),
                 "dynamics_val_loss": float(dynamics_val_metrics["next_obs_mse"]),
                 "dynamics_reward_loss": float(dynamics_train_metrics["dynamics_reward_loss"]),
                 "dynamics_done_loss": float(dynamics_train_metrics["dynamics_done_loss"]),
                 "uncertainty_mean": float(rollout_metrics["uncertainty_mean"]),
+                "root_uncertainty_mean": float(rollout_metrics.get("root_uncertainty_mean", float("nan"))),
                 "synthetic_return_mean": float(rollout_metrics["synthetic_reward_mean"]),
+                "dynamics_qpos_root_loss": float(dynamics_train_metrics.get("dynamics_qpos_root_loss", float("nan"))),
+                "dynamics_qvel_root_loss": float(dynamics_train_metrics.get("dynamics_qvel_root_loss", float("nan"))),
+                "dynamics_qpos_root_next_mse": float(dynamics_val_metrics.get("qpos_root_next_mse", float("nan"))),
+                "dynamics_qvel_root_next_mse": float(dynamics_val_metrics.get("qvel_root_next_mse", float("nan"))),
+                "formula_reward_mae": float(dynamics_val_metrics.get("formula_reward_mae", float("nan"))),
                 "online_avg_return": float("nan") if online_metrics is None else float(online_metrics["avg_return"]),
                 "online_avg_length": float("nan") if online_metrics is None else float(online_metrics["avg_length"]),
                 "online_survived_full": "" if online_metrics is None else int(online_metrics["survived_full"]),
@@ -1663,8 +2561,13 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
                     epoch=epoch,
                     obs_mean=obs_mean,
                     obs_std=obs_std,
+                    root_stats=root_stats,
                     args=args,
-                    metrics={"dynamics_val_metrics": dynamics_val_metrics, "rollout_metrics": rollout_metrics},
+                    metrics={
+                        "dynamics_val_metrics": dynamics_val_metrics,
+                        "rollout_metrics": rollout_metrics,
+                        "offline_bc_metrics": offline_bc_metrics,
+                    },
                 )
 
             if stop_training:
@@ -1681,6 +2584,7 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
         epoch=epoch,
         obs_mean=obs_mean,
         obs_std=obs_std,
+        root_stats=root_stats,
         args=args,
         metrics={"dynamics_val_metrics": dynamics_val_metrics, "best_online": best_online},
     )
@@ -1703,13 +2607,34 @@ def _run_training(args: argparse.Namespace) -> dict[str, Any]:
         "real_ratio": args.real_ratio,
         "rollout_horizon": args.rollout_horizon,
         "mopo_penalty_coef": args.mopo_penalty_coef,
+        "reward_scale": args.reward_scale,
+        "predict_root": bool(args.predict_root),
+        "predict_reward_head": bool(args.predict_reward_head),
+        "predict_done_head": bool(args.predict_done_head),
+        "formula_reward": bool(args.formula_reward),
+        "formula_done": bool(args.formula_done),
+        "actor_lr": args.actor_lr,
+        "critic_lr": args.critic_lr,
+        "temperature_lr": args.temperature_lr,
+        "actor_rl_coef": args.actor_rl_coef,
+        "bc_alpha": args.bc_alpha,
+        "bc_ref_alpha": args.bc_ref_alpha,
+        "bc_ref_on": args.bc_ref_on,
+        "critic_warmup_epochs": args.critic_warmup_epochs,
+        "actor_weight_normalization": args.actor_weight_normalization,
         "normalize_obs": args.normalize_obs,
         "reward_relabel": relabel_info,
         "dynamics_train_metrics": dynamics_train_metrics,
         "dynamics_val_metrics": dynamics_val_metrics,
         "train_actor_loss": _stats(metric_lists["train_actor_loss"]),
+        "train_actor_rl_loss": _stats(metric_lists["train_actor_rl_loss"]),
+        "train_actor_rl_loss_scaled": _stats(metric_lists["train_actor_rl_loss_scaled"]),
         "train_critic_loss": _stats(metric_lists["train_critic_loss"]),
         "train_bc_loss": _stats(metric_lists["train_bc_loss"]),
+        "train_bc_ref_loss": _stats(metric_lists["train_bc_ref_loss"]),
+        "offline_bc_mse_real": _stats(metric_lists["offline_bc_mse_real"]),
+        "offline_bc_mae_real": _stats(metric_lists["offline_bc_mae_real"]),
+        "offline_ref_mse_mixed": _stats(metric_lists["offline_ref_mse_mixed"]),
         "temperature_loss": _stats(metric_lists["temperature_loss"]),
         "uncertainty_mean": _stats(metric_lists["uncertainty_mean"]),
         "synthetic_return_mean": _stats(metric_lists["synthetic_reward_mean"]),
@@ -1764,9 +2689,13 @@ def main() -> None:
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--updates-per-epoch", type=int, default=None)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--actor-lr", type=float, default=3e-5)
+    parser.add_argument("--critic-lr", type=float, default=3e-4)
+    parser.add_argument("--temperature-lr", type=float, default=3e-4)
     parser.add_argument("--dynamics-lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip-norm", type=float, default=10.0)
+    parser.add_argument("--actor-weight-normalization", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--limit-trajectories", type=int, default=None)
     parser.add_argument("--limit-transitions", type=int, default=None)
@@ -1778,13 +2707,23 @@ def main() -> None:
     parser.add_argument("--dynamics-layers", type=int, default=3)
     parser.add_argument("--dynamics-epochs", type=int, default=50)
     parser.add_argument("--dynamics-steps", type=int, default=None)
+    parser.add_argument("--predict-root", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--predict-reward-head", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--predict-done-head", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--formula-reward", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--formula-done", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--root-loss-coef", type=float, default=1.0)
+    parser.add_argument("--qpos-root-loss-coef", type=float, default=1.0)
+    parser.add_argument("--qvel-root-loss-coef", type=float, default=1.0)
+    parser.add_argument("--quat-loss-coef", type=float, default=1.0)
     parser.add_argument("--reward-loss-coef", type=float, default=1.0)
     parser.add_argument("--done-loss-coef", type=float, default=0.1)
-    parser.add_argument("--rollout-horizon", type=int, default=3)
+    parser.add_argument("--rollout-horizon", type=int, default=1)
     parser.add_argument("--rollout-batch-size", type=int, default=4096)
     parser.add_argument("--model-rollout-ratio", type=float, default=1.0)
-    parser.add_argument("--real-ratio", type=float, default=0.5)
+    parser.add_argument("--real-ratio", type=float, default=0.9)
     parser.add_argument("--mopo-penalty-coef", type=float, default=1.0)
+    parser.add_argument("--reward-scale", type=float, default=50.0)
     parser.add_argument("--done-threshold", type=float, default=0.5)
     parser.add_argument("--force-last-action", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--discount", type=float, default=0.99)
@@ -1792,13 +2731,38 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.01)
     parser.add_argument("--auto-alpha", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--target-entropy", type=float, default=None)
-    parser.add_argument("--bc-alpha", type=float, default=0.1)
+    parser.add_argument("--bc-alpha", type=float, default=10.0)
+    parser.add_argument(
+        "--actor-rl-coef",
+        type=float,
+        default=1.0,
+        help="Scale applied to the SAC actor RL loss before adding BC/reference regularization.",
+    )
+    parser.add_argument(
+        "--bc-ref-alpha",
+        type=float,
+        default=0.0,
+        help="Weight for a frozen-BC reference action loss on selected observations.",
+    )
+    parser.add_argument(
+        "--bc-ref-on",
+        choices=["mixed", "synthetic", "real"],
+        default="mixed",
+        help="Observation batch used for the frozen-BC reference loss.",
+    )
+    parser.add_argument(
+        "--critic-warmup-epochs",
+        type=int,
+        default=0,
+        help="Number of initial epochs that update critic/temperature but skip actor updates.",
+    )
     parser.add_argument("--actor-update-period", type=int, default=1)
     parser.add_argument("--critic-num-blocks", type=int, default=2)
     parser.add_argument("--critic-hidden-dim", type=int, default=256)
     parser.add_argument("--critic-num-bins", type=int, default=101)
-    parser.add_argument("--critic-min-v", type=float, default=-20.0)
-    parser.add_argument("--critic-max-v", type=float, default=80.0)
+    parser.add_argument("--critic-min-v", type=float, default=-5.0)
+    parser.add_argument("--critic-max-v", type=float, default=50.0)
+    parser.add_argument("--offline-bc-eval-transitions", type=int, default=8192)
     parser.add_argument(
         "--eval-interval",
         type=int,
@@ -1818,6 +2782,14 @@ def main() -> None:
         args.bc_checkpoint = None
     if args.target_entropy is None:
         args.target_entropy = 0.5 * hrlg.ACTION_SIZE * math.log(2 * math.pi * math.e * 0.5**2)
+    if args.actor_rl_coef < 0:
+        raise ValueError("--actor-rl-coef must be non-negative.")
+    if args.bc_ref_alpha < 0:
+        raise ValueError("--bc-ref-alpha must be non-negative.")
+    if args.critic_warmup_epochs < 0:
+        raise ValueError("--critic-warmup-epochs must be non-negative.")
+    if args.bc_ref_alpha > 0 and args.bc_checkpoint is None:
+        raise ValueError("--bc-ref-alpha > 0 requires --bc-checkpoint.")
     _run_training(args)
 
 
