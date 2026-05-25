@@ -119,6 +119,9 @@ def create_envs(
         assert rescale_action is None, "Unused hyperparameter in Mujoco Playground."
         assert "use_domain_randomization" in kwargs
         assert "use_push_randomization" in kwargs
+        env_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("use_domain_randomization", "use_push_randomization")
+        }
         train_env = make_mujoco_playground_env(
             env_name=env_name,
             seed=seed,
@@ -126,6 +129,8 @@ def create_envs(
             max_episode_steps=max_episode_steps,
             use_domain_randomization=kwargs["use_domain_randomization"],
             use_push_randomization=kwargs["use_push_randomization"],
+            eval_mode=False,
+            **env_kwargs,
         )
         eval_env = make_mujoco_playground_env(
             env_name=env_name,
@@ -134,6 +139,8 @@ def create_envs(
             max_episode_steps=max_episode_steps,
             use_domain_randomization=False,
             use_push_randomization=False,
+            eval_mode=True,
+            **env_kwargs,
         )
         record_env = make_mujoco_playground_env(
             env_name=env_name,
@@ -142,6 +149,8 @@ def create_envs(
             max_episode_steps=max_episode_steps,
             use_domain_randomization=False,
             use_push_randomization=False,
+            eval_mode=True,
+            **env_kwargs,
         )
 
     elif env_type == "genesis":

@@ -1,0 +1,44 @@
+##################################################################################
+# MuJoCo Playground Go2 with humanoid_rl_gym-compatible policy I/O
+##################################################################################
+
+env_type: 'mujoco_playground'
+env_name: 'Go2JoystickFlatTerrainHRLG'
+num_env_steps: ${num_env_steps}
+
+seed: ${seed}
+num_train_envs: ${num_train_envs}
+num_eval_envs: ${num_eval_envs}
+num_record_envs: ${num_record_envs}
+rescale_action: null
+max_episode_steps: 1000
+use_domain_randomization: false
+use_push_randomization: false
+event_domain_randomization: false
+
+domain_randomization_config:
+  motor_zero_offset_enable: true
+  motor_zero_offset_range: [-0.035, 0.035]
+  action_delay_enable: true
+  action_delay_step_range: [0, 1]
+  push_enable: true
+  push_interval_range: [3.0, 8.0]
+  push_linear_velocity_range: [-0.4, 0.4]
+  push_vertical_velocity_range: [-0.05, 0.05]
+  push_roll_pitch_velocity_range: [-0.2, 0.2]
+  push_yaw_velocity_range: [-0.6, 0.6]
+
+# Go2 low-command distribution. Keep train/eval matched.
+command_config:
+  initial_step: 0
+  a: [0.5, 0.5, 1.0]
+  b: [1.0, 1.0, 1.0]
+  zero_command_prob: 0.10
+  resample_time_s: 5.0
+
+reward_config:
+  scales:
+    lin_vel_z: -5.0
+    dof_power: -1e-4
+    base_height: -20.0
+    similar_to_default: -0.05

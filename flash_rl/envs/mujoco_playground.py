@@ -11,6 +11,7 @@ from gymnasium.vector.utils import batch_space
 from mujoco_playground import registry
 from mujoco_playground._src.mjx_env import MjxEnv, State
 from mujoco_playground._src.wrapper import BraxDomainRandomizationVmapWrapper, Wrapper
+from omegaconf import OmegaConf
 
 from flash_rl.types import NDArray
 
@@ -28,7 +29,31 @@ MUJOCO_PLAYGROUND_HUMANOID_ENVS = [
 
 LOCAL_MUJOCO_PLAYGROUND_ENVS = [
     "G1JoystickFlatTerrainHRLG",
+    "Go2JoystickFlatTerrainHRLG",
 ]
+
+
+def _to_plain_config(value: Any) -> Any:
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    if hasattr(value, "items"):
+        return {k: _to_plain_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_config(v) for v in value]
+    return value
+
+
+def _update_config_dict(config: Any, updates: dict[str, Any]) -> None:
+    for key, value in updates.items():
+        value = _to_plain_config(value)
+        if value is None:
+            continue
+        if hasattr(config, key) and isinstance(value, dict):
+            current = getattr(config, key)
+            if hasattr(current, "items"):
+                _update_config_dict(current, value)
+                continue
+        config[key] = value
 
 
 def recursive_to_numpy(
@@ -214,19 +239,36 @@ def make_mujoco_playground_env(
     max_episode_steps: int,
     use_domain_randomization: bool,
     use_push_randomization: bool,
+    eval_mode: bool = False,
     height: int = 240,
     width: int = 320,
     **kwargs: Any,
 ) -> MujocoPlaygroundEnv:
     is_local_env = env_name in LOCAL_MUJOCO_PLAYGROUND_ENVS
-    if is_local_env:
+    local_env_cls = None
+    if env_name == "G1JoystickFlatTerrainHRLG":
         from flash_rl.envs.mujoco_playground_tasks.g1_hrlg import (
             G1JoystickFlatTerrainHRLG,
-            default_config as g1_hrlg_default_config,
             event_cfg_domain_randomize,
+        )
+        from flash_rl.envs.mujoco_playground_tasks.g1_hrlg import (
+            default_config as g1_hrlg_default_config,
         )
 
         cfg = g1_hrlg_default_config()
+        local_env_cls = G1JoystickFlatTerrainHRLG
+        domain_randomizer = event_cfg_domain_randomize
+    elif env_name == "Go2JoystickFlatTerrainHRLG":
+        from flash_rl.envs.mujoco_playground_tasks.go2_hrlg import (
+            Go2JoystickFlatTerrainHRLG,
+            event_cfg_domain_randomize,
+        )
+        from flash_rl.envs.mujoco_playground_tasks.go2_hrlg import (
+            default_config as go2_hrlg_default_config,
+        )
+
+        cfg = go2_hrlg_default_config()
+        local_env_cls = Go2JoystickFlatTerrainHRLG
         domain_randomizer = event_cfg_domain_randomize
     else:
         cfg = registry.get_default_config(env_name)
@@ -242,13 +284,27 @@ def make_mujoco_playground_env(
         randomization_fn = functools.partial(domain_randomizer, rng=randomization_rng)
         if is_local_env:
             cfg.event_domain_randomization = True
+    if is_local_env and kwargs:
+        _update_config_dict(cfg, kwargs)
+    if is_local_env and eval_mode and hasattr(cfg, "command_config"):
+        if "eval_start_step" in cfg.command_config:
+            cfg.command_config.initial_step = cfg.command_config.eval_start_step
     if is_humanoid_task and not use_push_randomization and not use_domain_randomization:
         cfg.push_config.enable = False
         cfg.push_config.magnitude_range = [0.0, 0.0]
+    if is_local_env and "push_config" in cfg and not use_push_randomization and not use_domain_randomization:
+        cfg.push_config.enable = False
+        if "magnitude_range" in cfg.push_config:
+            cfg.push_config.magnitude_range = [0.0, 0.0]
+        if "linear_velocity_range" in cfg.push_config:
+            cfg.push_config.linear_velocity_range = [0.0, 0.0]
+        if "angular_velocity_range" in cfg.push_config:
+            cfg.push_config.angular_velocity_range = [0.0, 0.0]
 
     # Raw env
     if is_local_env:
-        env = G1JoystickFlatTerrainHRLG(config=cfg)
+        assert local_env_cls is not None
+        env = local_env_cls(config=cfg)
     else:
         env = registry.load(env_name, config=cfg)
 
