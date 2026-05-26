@@ -158,6 +158,7 @@ tmp/**
 runs/
 videos/
 logs/
+figures/
 
 # cache
 *.ipynb_checkpoints
